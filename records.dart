@@ -1,7 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'sidebar.dart';
 
 // --- DESIGN TOKENS (same palette as dashboard, inbox, track, docu list, archive) ---
@@ -26,6 +31,16 @@ class _F {
   static const senderId = 'senderId'; // history
 }
 
+// History / document rows are matched on every field name your screens may
+// have used, so nobody who handled a document is missed.
+const _senderKeys = ['senderId', 'sender_id', 'uploaderId', 'uploader_id'];
+const _recipientKeys = [
+  'recipientId',
+  'receiverId',
+  'receiver_id',
+  'receiver_user_id'
+];
+
 enum RegistryType { incoming, outgoing, filing, logs }
 
 // --- DATA MODELS ---
@@ -46,6 +61,8 @@ class RegistryRecord {
   final DateTime? interactionDate;
   final String? timeReleased;
   final int? docNumber;
+  final bool pickupRequested;
+  final bool pickedUp;
 
   RegistryRecord({
     required this.id,
@@ -64,12 +81,22 @@ class RegistryRecord {
     this.interactionDate,
     this.timeReleased,
     this.docNumber,
+    this.pickupRequested = false,
+    this.pickedUp = false,
   });
 
   // Shown in the "Doc No." column: #0001, #0002... (falls back to the id for old documents)
   String get docNo => docNumber != null
       ? '#${docNumber.toString().padLeft(4, '0')}'
       : '#$id';
+
+  // e.g. "APPROVED - PICKED UP"
+  String get statusLabel {
+    final s = status.toUpperCase();
+    if (pickedUp) return '$s - PICKED UP';
+    if (pickupRequested) return '$s - PICK-UP REQUESTED';
+    return s;
+  }
 
   factory RegistryRecord.fromFirestore(DocumentSnapshot doc) {
     final data = doc.data() as Map<String, dynamic>? ?? {};
@@ -88,6 +115,8 @@ class RegistryRecord {
       createdAt: ts(data['createdAt']),
       interactionDate: ts(data['updatedAt']) ?? ts(data['createdAt']),
       docNumber: (data['docNumber'] as num?)?.toInt(),
+      pickupRequested: data['pickupRequested'] == true,
+      pickedUp: data['pickedUp'] == true,
     );
   }
 }
@@ -110,12 +139,14 @@ class FolderItem {
 class HistoryStep {
   final String status;
   final String senderName;
+  final String receiverName;
   final String officeName;
   final String movedAt;
 
   HistoryStep({
     required this.status,
     required this.senderName,
+    this.receiverName = '',
     required this.officeName,
     required this.movedAt,
   });
@@ -147,6 +178,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
 
   late Stream<List<RegistryRecord>> _recordsStream;
 
+  // Everything in the current tab + search (all pages). Used by Print log.
+  List<RegistryRecord> _visibleRecords = [];
+
   // Small caches so the same user/folder isn't re-read for every row
   final Map<String, Map<String, dynamic>> _userCache = {};
   final Map<String, Map<String, dynamic>> _folderCache = {};
@@ -161,9 +195,31 @@ class _RecordsScreenState extends State<RecordsScreen> {
     _recordsStream = _buildStream(_currentType);
   }
 
-  // ---------- DATA (mirrors the conditions in records.php) ----------
+  // ---------- DATA ----------
 
   DateTime? _ts(dynamic v) => v is Timestamp ? v.toDate() : null;
+
+  // First non-empty value among the given field names
+  String? _pick(Map<String, dynamic>? m, List<String> keys) {
+    if (m == null) return null;
+    for (final k in keys) {
+      final v = m[k]?.toString().trim();
+      if (v != null && v.isNotEmpty) return v;
+    }
+    return null;
+  }
+
+  // When a history step happened (a step still waiting for its server time returns null)
+  DateTime? _stepTime(Map<String, dynamic>? m) {
+    if (m == null) return null;
+    for (final k in ['movedAt', 'moved_at', 'createdAt', 'timestamp']) {
+      final t = _ts(m[k]);
+      if (t != null) return t;
+    }
+    return null;
+  }
+
+  int _ms(DateTime? t) => t?.millisecondsSinceEpoch ?? 9007199254740991;
 
   Future<Map<String, dynamic>> _lookup(
       String collection,
@@ -197,9 +253,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
       RegistryType type, {
         Map<String, dynamic>? h,
       }) async {
-    final senderId = (h?['senderId'] ?? d['senderId'])?.toString();
-    final recipientId = (h?['recipientId'] ?? d['recipientId'])?.toString();
-    final uploaderId = (d['uploaderId'] ?? d['senderId'])?.toString();
+    final senderId = _pick(h, _senderKeys) ?? _pick(d, _senderKeys);
+    final recipientId = _pick(h, _recipientKeys) ?? _pick(d, _recipientKeys);
+    final uploaderId = _pick(d, ['uploaderId', 'uploader_id', 'senderId', 'sender_id']);
     final folderId = (d['folderId'] ?? d['folder_id'])?.toString();
 
     final sender = await _lookup('users', senderId, _userCache);
@@ -207,10 +263,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
     final recipient = await _lookup('users', recipientId, _userCache);
     final folder = await _lookup('folders', folderId, _folderCache);
 
-    final moved =
-        _ts(h?['movedAt']) ?? _ts(d['updatedAt']) ?? _ts(d['createdAt']);
+    final moved = _stepTime(h) ?? _ts(d['updatedAt']) ?? _ts(d['createdAt']);
 
-    // PHP: Outgoing shows the uploader's office, Incoming/Logs the sender's
+    // Outgoing shows the uploader's office, Incoming/Logs the sender's
     final originOffice = type == RegistryType.outgoing
         ? _officeOf(uploader)
         : _officeOf(sender);
@@ -245,6 +300,8 @@ class _RecordsScreenState extends State<RecordsScreen> {
       interactionDate: moved,
       timeReleased: moved != null ? DateFormat('hh:mm a').format(moved) : 'N/A',
       docNumber: (d['docNumber'] as num?)?.toInt(),
+      pickupRequested: d['pickupRequested'] == true,
+      pickedUp: d['pickedUp'] == true,
     );
   }
 
@@ -262,69 +319,97 @@ class _RecordsScreenState extends State<RecordsScreen> {
 
     switch (type) {
       case RegistryType.incoming:
-      // PHP: latest step is addressed to me, status != approved
+      // Documents currently addressed to me. Once I forward one, the
+      // recipient changes and it leaves; approved / rejected ones are
+      // removed in _filterRecords. Logs keeps the proof.
         return docs
-            .where(_F.recipientId, isEqualTo: uid)
+            .where(Filter.or(
+          Filter(_F.recipientId, isEqualTo: uid),
+          Filter('receiverId', isEqualTo: uid),
+          Filter('receiver_user_id', isEqualTo: uid),
+        ))
             .snapshots()
             .asyncMap((s) => _fromDocs(s, type));
 
       case RegistryType.filing:
-      // PHP: (receiver = me OR uploader = me) AND approved
+      // Only documents I created (and that are approved, see _filterRecords)
         return docs
             .where(Filter.or(
-          Filter(_F.recipientId, isEqualTo: uid),
           Filter(_F.uploaderId, isEqualTo: uid),
+          Filter('uploader_id', isEqualTo: uid),
         ))
             .snapshots()
             .asyncMap((s) => _fromDocs(s, type));
 
       case RegistryType.outgoing:
-      // PHP: history.sender = me AND status IN (forwarded, uploaded).
-      // Your upload screen saves the first step as 'pending', so it counts too.
-        return _historyStream(
-          type: type,
-          field: _F.senderId,
-          uid: uid,
-          allowedStatuses: const ['forwarded', 'uploaded', 'pending'],
-        );
-
       case RegistryType.logs:
-      // PHP: history.receiver = me (every status)
-        return _historyStream(
-          type: type,
-          field: _F.recipientId,
-          uid: uid,
-        );
+        return _historyStream(type: type, uid: uid);
     }
   }
 
+  // Outgoing: the steps where I sent the document on.
+  // Logs: every document I was ever involved in (created, received, forwarded,
+  // approved or rejected), one record per document, kept as proof that it
+  // once passed through my office.
   Stream<List<RegistryRecord>> _historyStream({
     required RegistryType type,
-    required String field,
     required String uid,
-    List<String>? allowedStatuses,
   }) {
+    final isLogs = type == RegistryType.logs;
+    const outgoingStatuses = ['forwarded', 'uploaded', 'pending'];
+
+    bool sentBy(Map<String, dynamic> h) => _pick(h, _senderKeys) == uid;
+    bool receivedBy(Map<String, dynamic> h) =>
+        _pick(h, _recipientKeys) == uid;
+
     return FirebaseFirestore.instance
         .collection('documents')
         .snapshots()
         .asyncMap((snap) async {
-      final perDoc = await Future.wait(snap.docs.map((d) async {
-        // Query inside ONE document's history: no special index needed
-        final steps = await d.reference
-            .collection('history')
-            .where(field, isEqualTo: uid)
-            .get();
+      final perDoc = await Future.wait(
+          snap.docs.map<Future<List<RegistryRecord>>>((d) async {
+            final data = d.data();
 
-        final matching = steps.docs.where((h) {
-          if (allowedStatuses == null) return true;
-          final s = (h.data()['status'] ?? '').toString().toLowerCase();
-          return allowedStatuses.contains(s);
-        }).toList();
+            // Read the whole trail and match in code, so it works whatever
+            // field names each step was saved with
+            final stepsSnap = await d.reference.collection('history').get();
+            final steps = stepsSnap.docs.map((s) => s.data()).toList()
+              ..sort((a, b) => _ms(_stepTime(a)).compareTo(_ms(_stepTime(b))));
 
-        return Future.wait(
-          matching.map((h) => _toRecord(d.id, d.data(), type, h: h.data())),
-        );
-      }));
+            if (!isLogs) {
+              final mine = steps.where((h) {
+                final st = (h['status'] ?? '').toString().toLowerCase();
+                return sentBy(h) && outgoingStatuses.contains(st);
+              }).toList();
+              return await Future.wait(
+                  mine.map((h) => _toRecord(d.id, data, type, h: h)));
+            }
+
+            // Logs: the step where it reached my office, else the step where I
+            // sent it (I created it), else the document itself
+            Map<String, dynamic>? chosen;
+            for (final h in steps) {
+              if (receivedBy(h)) {
+                chosen = h;
+                break;
+              }
+            }
+            if (chosen == null) {
+              for (final h in steps) {
+                if (sentBy(h)) {
+                  chosen = h;
+                  break;
+                }
+              }
+            }
+
+            final involved = chosen != null ||
+                _pick(data, _senderKeys) == uid ||
+                _pick(data, _recipientKeys) == uid;
+            if (!involved) return <RegistryRecord>[];
+
+            return [await _toRecord(d.id, data, type, h: chosen)];
+          }));
 
       return perDoc.expand((r) => r).toList();
     });
@@ -336,28 +421,351 @@ class _RecordsScreenState extends State<RecordsScreen> {
         .collection('documents')
         .doc(docId)
         .collection('history')
-        .orderBy('movedAt', descending: true)
         .snapshots()
-        .asyncMap((snap) => Future.wait(snap.docs.map((doc) async {
-      final data = doc.data();
-      final u = await _lookup(
-          'users', data['senderId']?.toString(), _userCache);
-      final date = _ts(data['movedAt']);
-      return HistoryStep(
-        status: (data['status'] ?? 'pending').toString(),
-        senderName: _nameOf(u) ?? 'Staff',
-        officeName:
-        (data['destinationOffice'] ?? 'Registry').toString(),
-        movedAt: date != null
-            ? DateFormat('MMM dd, yyyy • hh:mm a').format(date)
-            : 'N/A',
-      );
-    })));
+        .asyncMap((snap) async {
+      final rows = snap.docs.map((d) => d.data()).toList()
+        ..sort((a, b) => _ms(_stepTime(b)).compareTo(_ms(_stepTime(a))));
+
+      return Future.wait<HistoryStep>(rows.map((data) async {
+        final sender =
+        await _lookup('users', _pick(data, _senderKeys), _userCache);
+        final receiver =
+        await _lookup('users', _pick(data, _recipientKeys), _userCache);
+        final date = _stepTime(data);
+        return HistoryStep(
+          status: (data['status'] ?? 'pending').toString(),
+          senderName: _nameOf(sender) ?? 'Staff',
+          receiverName: _nameOf(receiver) ?? '',
+          officeName: (data['destinationOffice'] ?? 'Registry').toString(),
+          movedAt: date != null
+              ? DateFormat('MMM dd, yyyy • hh:mm a').format(date)
+              : 'N/A',
+        );
+      }));
+    });
   }
 
   String _formatDate(DateTime? date, {String format = 'MM/dd/yyyy'}) {
     if (date == null) return 'N/A';
     return DateFormat(format).format(date);
+  }
+
+  // ---------- PRINT ----------
+
+  // Edit this to the real campus address
+  static const _addressLine = '[Address, Zip Code, Bohol, Philippines]';
+
+  // Title under the header, follows the active tab
+  String get _printTitle {
+    switch (_currentType) {
+      case RegistryType.incoming:
+        return 'INCOMING';
+      case RegistryType.outgoing:
+        return 'OUTGOING';
+      case RegistryType.filing:
+        return 'FILING';
+      case RegistryType.logs:
+        return 'LOGS';
+    }
+  }
+
+  Future<pw.MemoryImage?> _loadLogo(String path) async {
+    try {
+      final data = await rootBundle.load(path);
+      return pw.MemoryImage(data.buffer.asUint8List());
+    } catch (_) {
+      return null; // logo file missing, skip it
+    }
+  }
+
+  List<String> _printHeaders() {
+    switch (_currentType) {
+      case RegistryType.outgoing:
+        return [
+          'Date Received', 'Doc No.', 'Office of Origin', "Sender's Office",
+          'Destination Office', 'Addressee', 'Document Title',
+          'Responsible Person', 'Signature', 'Date Released', 'Time Released'
+        ];
+      case RegistryType.filing:
+        return [
+          'Date', 'Doc No.', 'Office of Origin', 'Document Title',
+          'Responsible Person', 'Folder Name', 'Location'
+        ];
+      case RegistryType.logs:
+      case RegistryType.incoming:
+        return [
+          'Date Received', 'Doc No.', 'Office of Origin', 'Document Title',
+          'Responsible Person', 'Status'
+        ];
+    }
+  }
+
+  List<List<String>> _printRows(List<RegistryRecord> records) {
+    return records.map((r) {
+      switch (_currentType) {
+        case RegistryType.outgoing:
+          return [
+            _formatDate(r.createdAt, format: 'MMM dd, yyyy'),
+            r.docNo,
+            r.originOffice,
+            r.senderOffice,
+            r.destinationOffice,
+            r.receiverName,
+            r.title,
+            r.uploaderName,
+            '', // Signature column (filled with the image when printing)
+            _formatDate(r.interactionDate, format: 'MMM dd, yyyy'),
+            r.timeReleased ?? 'N/A',
+          ];
+        case RegistryType.filing:
+          return [
+            _formatDate(r.interactionDate),
+            r.docNo,
+            r.originOffice,
+            r.title,
+            r.uploaderName,
+            r.folderName ?? 'Unassigned',
+            r.folderLocation ?? 'Vault-A',
+          ];
+        case RegistryType.logs:
+          return [
+            _formatDate(r.interactionDate),
+            r.docNo,
+            r.originOffice,
+            r.title,
+            r.senderName,
+            r.status.toUpperCase(), // plain status only (no pick-up text)
+          ];
+        case RegistryType.incoming:
+          return [
+            _formatDate(r.interactionDate),
+            r.docNo,
+            r.originOffice,
+            r.title,
+            r.senderName,
+            r.status.toUpperCase(),
+          ];
+      }
+    }).toList();
+  }
+
+  pw.Widget _pdfHeader({
+    required String office,
+    pw.MemoryImage? seal,
+    pw.MemoryImage? bagong,
+    pw.MemoryImage? tuv,
+  }) {
+    final tag = pw.Font.timesItalic();
+    final tagBold = pw.Font.timesBoldItalic();
+
+    pw.TextSpan letter(String first, String rest) => pw.TextSpan(children: [
+      pw.TextSpan(
+          text: first, style: pw.TextStyle(font: tagBold, fontSize: 10)),
+      pw.TextSpan(
+          text: rest, style: pw.TextStyle(font: tag, fontSize: 10)),
+    ]);
+
+    pw.TextSpan bar() =>
+        pw.TextSpan(text: ' | ', style: pw.TextStyle(font: tag, fontSize: 10));
+
+    return pw.Column(
+      crossAxisAlignment: pw.CrossAxisAlignment.start,
+      children: [
+        pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.center,
+          children: [
+            if (seal != null) pw.Image(seal, width: 62, height: 62),
+            pw.SizedBox(width: 14),
+            pw.Expanded(
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text('Republic of the Philippines',
+                      style: const pw.TextStyle(fontSize: 11)),
+                  pw.Text('BOHOL ISLAND STATE UNIVERSITY',
+                      style: pw.TextStyle(
+                          fontSize: 13, fontWeight: pw.FontWeight.bold)),
+                  pw.Text(_addressLine,
+                      style: const pw.TextStyle(fontSize: 11)),
+                  pw.RichText(
+                    text: pw.TextSpan(children: [
+                      const pw.TextSpan(
+                          text: 'Office of the ',
+                          style: pw.TextStyle(fontSize: 11)),
+                      pw.TextSpan(
+                        text: '  $office  ',
+                        style: const pw.TextStyle(
+                          fontSize: 11,
+                          decoration: pw.TextDecoration.underline,
+                        ),
+                      ),
+                    ]),
+                  ),
+                  pw.SizedBox(height: 6),
+                  pw.RichText(
+                    text: pw.TextSpan(children: [
+                      letter('B', 'alance'),
+                      bar(),
+                      letter('I', 'ntegrity'),
+                      bar(),
+                      letter('S', 'tewardship'),
+                      bar(),
+                      letter('U', 'prightness'),
+                    ]),
+                  ),
+                ],
+              ),
+            ),
+            if (bagong != null) pw.Image(bagong, height: 58),
+            pw.SizedBox(width: 10),
+            if (tuv != null) pw.Image(tuv, height: 58),
+          ],
+        ),
+        pw.SizedBox(height: 18),
+        pw.Center(
+          child: pw.Text(
+            _printTitle,
+            style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold),
+          ),
+        ),
+        pw.SizedBox(height: 12),
+      ],
+    );
+  }
+
+  // Downloads the user's e-signature (users/{uid}.signatureUrl) for the PDF.
+  // Returns null when there is none or it cannot be downloaded, so the printout
+  // falls back to a blank line that can be signed by hand.
+  Future<pw.MemoryImage?> _loadSignature(String? url) async {
+    if (url == null || url.isEmpty) return null;
+    try {
+      // Ask Cloudinary for a JPG with a white background: transparent areas
+      // become white, and the PDF can always read the format (webp/etc. fail)
+      final fixed = url.contains('/upload/')
+          ? url.replaceFirst('/upload/', '/upload/b_white,f_jpg/')
+          : url;
+      final res = await http.get(Uri.parse(fixed));
+      if (res.statusCode != 200 || res.bodyBytes.isEmpty) return null;
+      return pw.MemoryImage(res.bodyBytes);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Table for the printout. On Outgoing, the "Signature" column holds the
+  // signed-in user's e-signature image (or a blank space to sign by hand).
+  pw.Widget _pdfTable({
+    required List<String> headers,
+    required List<List<String>> rows,
+    pw.MemoryImage? signature,
+  }) {
+    final sigIndex = headers.indexOf('Signature');
+
+    pw.Widget cell(String text, {bool bold = false}) => pw.Padding(
+      padding: const pw.EdgeInsets.symmetric(horizontal: 4, vertical: 5),
+      child: pw.Text(
+        text,
+        style: pw.TextStyle(
+          fontSize: 8,
+          fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+        ),
+      ),
+    );
+
+    pw.Widget signatureCell() => pw.Container(
+      height: 30,
+      padding: const pw.EdgeInsets.all(2),
+      alignment: pw.Alignment.center,
+      child: signature != null
+          ? pw.Image(signature, height: 26, fit: pw.BoxFit.contain)
+          : pw.SizedBox(),
+    );
+
+    // Column widths (relative), so 11 columns fit the landscape page
+    final widths = <int, pw.TableColumnWidth>{};
+    for (var i = 0; i < headers.length; i++) {
+      final h = headers[i];
+      double w = 1;
+      if (h == 'Doc No.') w = 0.7;
+      if (h == 'Document Title') w = 1.5;
+      if (h == 'Signature') w = 1.2;
+      if (h == 'Status') w = 1.2;
+      widths[i] = pw.FlexColumnWidth(w);
+    }
+
+    final data = rows.isEmpty
+        ? [List.generate(headers.length, (i) => i == 0 ? 'No records' : '')]
+        : rows;
+
+    return pw.Table(
+      border: pw.TableBorder.all(color: PdfColors.grey600, width: 0.5),
+      defaultVerticalAlignment: pw.TableCellVerticalAlignment.middle,
+      columnWidths: widths,
+      children: [
+        pw.TableRow(
+          repeat: true,
+          decoration: const pw.BoxDecoration(color: PdfColors.grey200),
+          children: headers.map((h) => cell(h, bold: true)).toList(),
+        ),
+        ...data.map(
+              (r) => pw.TableRow(
+            children: [
+              for (var i = 0; i < r.length; i++)
+                (i == sigIndex && rows.isNotEmpty)
+                    ? signatureCell()
+                    : cell(r[i]),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _printLog() async {
+    _styledSnack(context, 'Preparing document for print...');
+
+    try {
+      // Office of the signed-in user
+      // Read fresh (not cached) so a newly uploaded signature is picked up
+      final meSnap =
+      await FirebaseFirestore.instance.collection('users').doc(_uid).get();
+      final me = meSnap.data() ?? <String, dynamic>{};
+      final office = _officeOf(me) ?? '______________________';
+
+      final seal = await _loadLogo('assets/bisu_logo.png');
+      final bagong = await _loadLogo('assets/bagong_pilipinas.png');
+      final tuv = await _loadLogo('assets/tuv_cert.png');
+
+      // E-signature is only used on the Outgoing printout
+      final isOutgoing = _currentType == RegistryType.outgoing;
+      final signature = isOutgoing
+          ? await _loadSignature(_pick(me, ['signatureUrl']))
+          : null;
+
+      final headers = _printHeaders();
+      final rows = _printRows(_visibleRecords);
+
+      final doc = pw.Document();
+      doc.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4.landscape,
+          margin: const pw.EdgeInsets.fromLTRB(28, 24, 28, 28),
+          build: (ctx) => [
+            _pdfHeader(office: office, seal: seal, bagong: bagong, tuv: tuv),
+            _pdfTable(headers: headers, rows: rows, signature: signature),
+          ],
+        ),
+      );
+
+      await Printing.layoutPdf(
+        name: '${_printTitle}_${DateFormat('yyyyMMdd').format(DateTime.now())}',
+        onLayout: (_) => doc.save(),
+      );
+    } catch (e) {
+      if (mounted) {
+        _styledSnack(context, 'Could not prepare print: $e', color: _C.red);
+      }
+    }
   }
 
   // ---------- UI HELPERS (styling only) ----------
@@ -822,7 +1230,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
                                   ),
                                   const SizedBox(height: 3),
                                   Text(
-                                    step.senderName,
+                                    step.receiverName.isEmpty
+                                        ? step.senderName
+                                        : '${step.senderName}  →  ${step.receiverName}',
                                     style: const TextStyle(
                                       fontSize: 13,
                                       fontWeight: FontWeight.w800,
@@ -866,11 +1276,15 @@ class _RecordsScreenState extends State<RecordsScreen> {
 
       if (!matchSearch) return false;
 
+      final status = doc.status.toLowerCase();
+
       switch (_currentType) {
         case RegistryType.incoming:
-          return doc.status != 'approved';
+        // Leaves Incoming once I approve or reject it (forwarding moves
+        // the recipient, so it leaves on its own). Logs keeps the proof.
+          return status != 'approved' && status != 'rejected';
         case RegistryType.filing:
-          if (doc.status != 'approved') return false;
+          if (status != 'approved') return false;
           return _activeFolderId != null
               ? doc.folderId == _activeFolderId
               : (doc.folderId == null || doc.folderId!.isEmpty);
@@ -880,7 +1294,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
       }
     }).toList();
 
-    // PHP: ORDER BY moved_at / updated_at ASC (flip a and b for newest first)
+    // ORDER BY moved_at / updated_at ASC (flip a and b for newest first)
     result.sort((a, b) => (a.interactionDate ?? DateTime(0))
         .compareTo(b.interactionDate ?? DateTime(0)));
     return result;
@@ -893,20 +1307,20 @@ class _RecordsScreenState extends State<RecordsScreen> {
         titles = [
           'Date Received', 'Doc No.', 'Office of Origin', 'Sender\'s Office',
           'Destination Office', 'Addressee', 'Document Title',
-          'Responsible Person', 'Date Released', 'Time Released', 'Trail'
+          'Responsible Person', 'Date Released', 'Time Released', 'Actions'
         ];
         break;
       case RegistryType.filing:
         titles = [
           'Date', 'Doc No.', 'Office of Origin', 'Document Title',
-          'Responsible Person', 'Folder Name', 'Location', 'Trail'
+          'Responsible Person', 'Folder Name', 'Location', 'Actions'
         ];
         break;
       case RegistryType.logs:
       case RegistryType.incoming:
         titles = [
           'Date Received', 'Doc No.', 'Office of Origin', 'Document Title',
-          'Responsible Person', 'Status', 'Trail'
+          'Responsible Person', 'Status', 'Actions'
         ];
         break;
     }
@@ -1010,51 +1424,61 @@ class _RecordsScreenState extends State<RecordsScreen> {
             DataCell(Text(row.originOffice)),
             DataCell(Text(row.title, style: titleStyle)),
             DataCell(Text(row.senderName)),
-            DataCell(_statusPill(row.status.toUpperCase(), statusBg, statusText)),
+            // Logs shows the pick-up state, e.g. "APPROVED - PICKED UP"
+            DataCell(_statusPill(
+              _currentType == RegistryType.logs
+                  ? row.statusLabel
+                  : row.status.toUpperCase(),
+              row.pickedUp ? const Color(0xFFE6F5EE) : statusBg,
+              row.pickedUp ? _C.green : statusText,
+            )),
           ];
           break;
       }
 
-      // Trail + Delete actions
+      // Trail on every tab. Delete is hidden on Logs: Logs is the proof of
+      // who handled the document, so it must not be removable from there.
       cells.add(
         DataCell(
           Row(
             children: [
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _C.ink,
-                  foregroundColor: Colors.white,
-                  elevation: 0,
-                  padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10)),
-                ),
-                onPressed: () => _openHistoryModal(row.id),
-                icon: const Icon(Icons.alt_route_rounded, size: 14),
-                label: const Text(
-                  "View trail",
-                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-                ),
-              ),
-              const SizedBox(width: 6),
               Material(
-                color: const Color(0xFFFBEAEA),
+                color: const Color(0xFFE8F0FE),
                 borderRadius: BorderRadius.circular(10),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(10),
-                  onTap: () => _confirmDelete(row.id, row.title),
-                  child: const Tooltip(
-                    message: 'Delete document',
-                    child: SizedBox(
+                  onTap: () => _openHistoryModal(row.id),
+                  child: Tooltip(
+                    message: 'View trail',
+                    child: const SizedBox(
                       width: 34,
                       height: 34,
-                      child: Icon(Icons.delete_outline_rounded,
-                          size: 18, color: _C.red),
+                      child: Icon(Icons.alt_route_rounded,
+                          size: 18, color: _C.blue),
                     ),
                   ),
                 ),
               ),
+              if (_currentType != RegistryType.logs) ...[
+                const SizedBox(width: 8),
+                Material(
+                  color: const Color(0xFFFBEAEA),
+                  borderRadius: BorderRadius.circular(10),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: () => _confirmDelete(row.id, row.title),
+                    child: const Tooltip(
+                      message: 'Delete document',
+                      child: SizedBox(
+                        width: 34,
+                        height: 34,
+                        child: Icon(Icons.delete_outline_rounded,
+                            size: 18, color: _C.red),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -1179,16 +1603,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
               _headerActionButton(
                 icon: Icons.print_outlined,
                 label: "Print log",
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: const Text("Preparing document for print..."),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                    ),
-                  );
-                },
+                onPressed: _printLog,
               ),
             ],
           ),
@@ -1229,6 +1644,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
                               setState(() {
                                 _currentType = type;
                                 _currentPage = 1;
+                                _visibleRecords = [];
                                 _recordsStream = _buildStream(type);
                               });
                             },
@@ -1276,6 +1692,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
                       if (snapshot.hasData) {
                         filteredRecords = _filterRecords(snapshot.data!);
                       }
+
+                      // Keep the full filtered list for Print log
+                      _visibleRecords = filteredRecords;
 
                       final totalRecords = filteredRecords.length;
                       final totalPages = (totalRecords / _itemsPerPage).ceil();

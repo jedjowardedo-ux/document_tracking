@@ -3,6 +3,7 @@ import 'dashboard_screen.dart';
 import 'upload_screen.dart';
 import 'sign_in_screen.dart';
 import 'inbox_screen.dart';
+import 'chat_screen.dart';
 import 'track_screen.dart';
 import 'docu_list_screen.dart'; // Make sure to create or import your DocuListScreen file
 import 'archive_screen.dart';
@@ -131,6 +132,9 @@ class Sidebar extends StatelessWidget {
       case 'inbox.php':
         targetScreen = const InboxScreen();
         break;
+      case 'chat.php':
+        targetScreen = const ChatScreen();
+        break;
       case 'docu_list.php':
         targetScreen = const DocuListScreen();
         break;
@@ -249,6 +253,12 @@ class Sidebar extends StatelessWidget {
                       icon: Icons.notifications_outlined,
                       pageName: 'inbox.php',
                       badgeCount: notificationCount,
+                    ),
+                    _buildNavItem(
+                      context,
+                      title: 'Chat',
+                      icon: Icons.chat_bubble_outline_rounded,
+                      pageName: 'chat.php',
                     ),
                     _buildNavItem(
                       context,

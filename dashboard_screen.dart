@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloudinary_public/cloudinary_public.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:intl/intl.dart';
 import 'sidebar.dart';
 import 'upload_screen.dart';
@@ -35,15 +37,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final User? _currentUser = FirebaseAuth.instance.currentUser;
 
+  // Same Cloudinary account as the upload screen
+  final CloudinaryPublic _cloudinary = CloudinaryPublic(
+    'nikh0hne',
+    'document_tracking_uploads',
+    cache: false,
+  );
+
   late TextEditingController _nameController;
   late TextEditingController _positionController;
+  final _currentPasswordController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
 
   String userName = "Loading...";
   String officeName = "Loading...";
   String position = "";
+  String? photoUrl;
+  String? signatureUrl;
+
   bool _isUpdating = false;
+  bool _isChangingPassword = false;
+  bool _uploadingPhoto = false;
+  bool _uploadingSignature = false;
+  bool _hidePasswords = true;
 
   // Receiver name lookup cache
   final Map<String, Future<String>> _receiverNameCache = {};
@@ -60,6 +77,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void dispose() {
     _nameController.dispose();
     _positionController.dispose();
+    _currentPasswordController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
@@ -76,10 +94,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     if (doc.exists && mounted) {
       final data = doc.data()!;
+      final photo = (data['photoUrl'] ?? '').toString().trim();
+      final sig = (data['signatureUrl'] ?? '').toString().trim();
       setState(() {
         userName = data['name'] ?? data['userName'] ?? 'User';
         officeName = data['officeName'] ?? data['office'] ?? 'General Office';
         position = data['position'] ?? 'Staff';
+        photoUrl = photo.isEmpty ? null : photo;
+        signatureUrl = sig.isEmpty ? null : sig;
         _nameController.text = userName;
         _positionController.text = position;
       });
@@ -108,9 +130,31 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  // Update profile details in Firestore and Firebase Auth
+  // ---------- ACCOUNT SETTINGS ----------
+
+  void _snack(String message, {Color? color}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: color,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+
+  // Save name + position
   Future<void> _updateProfile() async {
     if (_currentUser == null) return;
+
+    final name = _nameController.text.trim();
+    final pos = _positionController.text.trim();
+
+    if (name.isEmpty) {
+      _snack('Full name cannot be empty.', color: _C.red);
+      return;
+    }
 
     setState(() => _isUpdating = true);
 
@@ -119,45 +163,220 @@ class _DashboardScreenState extends State<DashboardScreen> {
           .collection('users')
           .doc(_currentUser!.uid)
           .update({
-        'name': _nameController.text.trim(),
-        'position': _positionController.text.trim(),
+        'name': name,
+        'position': pos,
       });
 
-      if (_passwordController.text.isNotEmpty) {
-        if (_passwordController.text == _confirmPasswordController.text) {
-          await _currentUser!.updatePassword(_passwordController.text.trim());
-        } else {
-          throw Exception('Passwords do not match');
-        }
-      }
-
+      if (!mounted) return;
       setState(() {
-        userName = _nameController.text.trim();
-        position = _positionController.text.trim();
+        userName = name;
+        position = pos;
       });
 
-      if (!mounted) return;
-      Navigator.of(context).pop();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('Account updated successfully!'),
-          backgroundColor: _C.blue,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        ),
-      );
+      Navigator.of(context).pop(); // close the drawer
+      _snack('Profile updated successfully!', color: _C.blue);
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Update failed: $e'),
-          backgroundColor: _C.red,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        ),
-      );
+      _snack('Update failed: $e', color: _C.red);
     } finally {
       if (mounted) setState(() => _isUpdating = false);
+    }
+  }
+
+  // Pick an image and upload it to Cloudinary, then save the URL on the user.
+  // isSignature = false -> photoUrl, true -> signatureUrl
+  Future<void> _pickAndUploadImage({required bool isSignature}) async {
+    if (_currentUser == null) return;
+    if (isSignature ? _uploadingSignature : _uploadingPhoto) return;
+
+    // file_picker 12: static pickFile(), bytes are read with readAsBytes()
+    final file = await FilePicker.pickFile(type: FileType.image);
+    if (file == null) return;
+
+    final bytes = await file.readAsBytes();
+    if (bytes.isEmpty) {
+      _snack('Could not read that image. Try another one.', color: _C.red);
+      return;
+    }
+    if (bytes.lengthInBytes > 5 * 1024 * 1024) {
+      _snack('Image must be smaller than 5 MB.', color: _C.red);
+      return;
+    }
+
+    setState(() {
+      if (isSignature) {
+        _uploadingSignature = true;
+      } else {
+        _uploadingPhoto = true;
+      }
+    });
+
+    try {
+      final res = await _cloudinary.uploadFile(
+        CloudinaryFile.fromBytesData(
+          bytes,
+          identifier: file.name,
+          resourceType: CloudinaryResourceType.Image,
+        ),
+      );
+
+      final url = res.secureUrl;
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(_currentUser!.uid)
+          .update({isSignature ? 'signatureUrl' : 'photoUrl': url});
+
+      if (!mounted) return;
+      setState(() {
+        if (isSignature) {
+          signatureUrl = url;
+        } else {
+          photoUrl = url;
+        }
+      });
+      _snack(
+        isSignature ? 'E-signature saved.' : 'Profile photo updated.',
+        color: _C.green,
+      );
+    } catch (e) {
+      _snack('Upload failed: $e', color: _C.red);
+    } finally {
+      if (mounted) {
+        setState(() {
+          if (isSignature) {
+            _uploadingSignature = false;
+          } else {
+            _uploadingPhoto = false;
+          }
+        });
+      }
+    }
+  }
+
+  Future<void> _removeImage({required bool isSignature}) async {
+    if (_currentUser == null) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(
+          isSignature ? 'Remove e-signature?' : 'Remove profile photo?',
+          style: const TextStyle(
+              fontWeight: FontWeight.w800, fontSize: 16, color: _C.ink),
+        ),
+        content: Text(
+          isSignature
+              ? 'Outgoing documents will no longer include your signature until you upload a new one.'
+              : 'Your initial will be shown instead.',
+          style: const TextStyle(fontSize: 13, color: _C.muted, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Remove', style: TextStyle(color: _C.red)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(_currentUser!.uid)
+          .update({isSignature ? 'signatureUrl' : 'photoUrl': FieldValue.delete()});
+
+      if (!mounted) return;
+      setState(() {
+        if (isSignature) {
+          signatureUrl = null;
+        } else {
+          photoUrl = null;
+        }
+      });
+      _snack(isSignature ? 'E-signature removed.' : 'Profile photo removed.');
+    } catch (e) {
+      _snack('Could not remove: $e', color: _C.red);
+    }
+  }
+
+  // Change password (re-authenticates with the current password first)
+  Future<void> _changePassword() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final current = _currentPasswordController.text;
+    final next = _passwordController.text;
+    final confirm = _confirmPasswordController.text;
+
+    if (current.isEmpty || next.isEmpty || confirm.isEmpty) {
+      _snack('Fill in all three password fields.', color: _C.red);
+      return;
+    }
+    if (next.length < 6) {
+      _snack('New password must be at least 6 characters.', color: _C.red);
+      return;
+    }
+    if (next != confirm) {
+      _snack('New passwords do not match.', color: _C.red);
+      return;
+    }
+    if (next == current) {
+      _snack('New password must be different from the current one.',
+          color: _C.red);
+      return;
+    }
+    final email = user.email;
+    if (email == null || email.isEmpty) {
+      _snack('This account has no email, so the password cannot be changed here.',
+          color: _C.red);
+      return;
+    }
+
+    setState(() => _isChangingPassword = true);
+
+    try {
+      final cred = EmailAuthProvider.credential(email: email, password: current);
+      await user.reauthenticateWithCredential(cred);
+      await user.updatePassword(next);
+
+      _currentPasswordController.clear();
+      _passwordController.clear();
+      _confirmPasswordController.clear();
+
+      if (!mounted) return;
+      Navigator.of(context).pop(); // close the drawer
+      _snack('Password changed successfully!', color: _C.green);
+    } on FirebaseAuthException catch (e) {
+      String msg;
+      switch (e.code) {
+        case 'wrong-password':
+        case 'invalid-credential':
+          msg = 'Current password is incorrect.';
+          break;
+        case 'weak-password':
+          msg = 'New password is too weak.';
+          break;
+        case 'requires-recent-login':
+          msg = 'Please log out and log in again, then retry.';
+          break;
+        case 'too-many-requests':
+          msg = 'Too many attempts. Try again later.';
+          break;
+        default:
+          msg = e.message ?? 'Could not change password.';
+      }
+      _snack(msg, color: _C.red);
+    } catch (e) {
+      _snack('Could not change password: $e', color: _C.red);
+    } finally {
+      if (mounted) setState(() => _isChangingPassword = false);
     }
   }
 
@@ -206,6 +425,34 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   String get _initial =>
       userName.trim().isNotEmpty ? userName.trim()[0].toUpperCase() : 'U';
+
+  // Profile picture, or the initial when there is none. Fills its parent.
+  Widget _avatarContent(double fontSize) {
+    final initial = Center(
+      child: Text(
+        _initial,
+        style: TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.w700,
+          fontSize: fontSize,
+        ),
+      ),
+    );
+
+    if (photoUrl == null) return initial;
+
+    return ClipOval(
+      child: Image.network(
+        photoUrl!,
+        fit: BoxFit.cover,
+        width: double.infinity,
+        height: double.infinity,
+        errorBuilder: (_, __, ___) => initial,
+        loadingBuilder: (context, child, progress) =>
+        progress == null ? child : initial,
+      ),
+    );
+  }
 
   // (foreground, background, icon, label)
   (Color, Color, IconData, String) _statusStyle(String status) {
@@ -363,16 +610,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             color: Colors.white.withValues(alpha: 0.85),
                             width: 2),
                       ),
-                      child: Center(
-                        child: Text(
-                          _initial,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 17,
-                          ),
-                        ),
-                      ),
+                      child: _avatarContent(17),
                     ),
                     Positioned(
                       right: -2,
@@ -1104,17 +1342,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const SizedBox(height: 12),
                 Row(
                   children: [
-                    CircleAvatar(
-                      radius: 32,
-                      backgroundColor: _C.blue,
-                      child: Text(
-                        _initial,
-                        style: const TextStyle(
-                          fontSize: 26,
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                        ),
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: const BoxDecoration(
+                        color: _C.blue,
+                        shape: BoxShape.circle,
                       ),
+                      child: _avatarContent(26),
                     ),
                     const SizedBox(width: 16),
                     Expanded(
@@ -1157,10 +1392,62 @@ class _DashboardScreenState extends State<DashboardScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // ----- PROFILE -----
                   _drawerSection('Profile'),
+                  Row(
+                    children: [
+                      _uploadingPhoto
+                          ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                          : const Icon(Icons.photo_camera_outlined,
+                          size: 20, color: _C.muted),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          photoUrl == null
+                              ? 'No profile photo yet'
+                              : 'Profile photo set',
+                          style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: _C.text),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _drawerButton(
+                          icon: Icons.upload_rounded,
+                          label: photoUrl == null ? 'Add photo' : 'Change photo',
+                          onPressed: _uploadingPhoto
+                              ? null
+                              : () => _pickAndUploadImage(isSignature: false),
+                        ),
+                      ),
+                      if (photoUrl != null) ...[
+                        const SizedBox(width: 8),
+                        _drawerButton(
+                          icon: Icons.delete_outline_rounded,
+                          label: 'Remove',
+                          danger: true,
+                          onPressed: _uploadingPhoto
+                              ? null
+                              : () => _removeImage(isSignature: false),
+                        ),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 18),
                   _buildDrawerLabel('Full name'),
                   TextField(
                     controller: _nameController,
+                    textCapitalization: TextCapitalization.words,
                     decoration: _drawerInputDecoration('Full name',
                         icon: Icons.person_outline_rounded),
                   ),
@@ -1168,56 +1455,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   _buildDrawerLabel('Position'),
                   TextField(
                     controller: _positionController,
+                    textCapitalization: TextCapitalization.words,
                     decoration: _drawerInputDecoration('Position',
                         icon: Icons.badge_outlined),
                   ),
-                  const SizedBox(height: 24),
-                  _drawerSection('E-signature'),
+                  const SizedBox(height: 14),
+                  _buildDrawerLabel('Office'),
                   Container(
-                    height: 84,
                     width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 14),
                     decoration: BoxDecoration(
-                      color: Colors.white,
+                      color: const Color(0xFFEEF2F7),
                       borderRadius: BorderRadius.circular(14),
                       border: Border.all(color: _C.line),
                     ),
-                    child: const Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
+                    child: Row(
                       children: [
-                        Icon(Icons.draw_outlined, color: _C.faint),
-                        SizedBox(height: 4),
-                        Text(
-                          'Upload signature image',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _C.muted,
-                            fontWeight: FontWeight.w600,
+                        const Icon(Icons.apartment_rounded,
+                            size: 20, color: _C.faint),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            officeName,
+                            style: const TextStyle(
+                                fontSize: 14, color: _C.muted),
                           ),
                         ),
                       ],
                     ),
                   ),
-                  const SizedBox(height: 24),
-                  _drawerSection('Security'),
-                  _buildDrawerLabel('New password'),
-                  TextField(
-                    controller: _passwordController,
-                    obscureText: true,
-                    decoration: _drawerInputDecoration('New password',
-                        icon: Icons.lock_outline_rounded),
-                  ),
-                  const SizedBox(height: 12),
-                  _buildDrawerLabel('Confirm password'),
-                  TextField(
-                    controller: _confirmPasswordController,
-                    obscureText: true,
-                    decoration: _drawerInputDecoration('Confirm password',
-                        icon: Icons.lock_reset_rounded),
-                  ),
-                  const SizedBox(height: 28),
+                  const SizedBox(height: 16),
                   SizedBox(
                     width: double.infinity,
-                    height: 50,
+                    height: 48,
                     child: ElevatedButton(
                       onPressed: _isUpdating ? null : _updateProfile,
                       style: ElevatedButton.styleFrom(
@@ -1235,17 +1506,189 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             color: Colors.white, strokeWidth: 2),
                       )
                           : const Text(
-                        'Save changes',
+                        'Save profile',
                         style: TextStyle(
                             fontWeight: FontWeight.w700, fontSize: 15),
                       ),
                     ),
                   ),
+
+                  // ----- E-SIGNATURE -----
+                  const SizedBox(height: 28),
+                  _drawerSection('E-signature'),
+                  const Text(
+                    'Used on documents you send out. A PNG with a transparent or white background works best.',
+                    style: TextStyle(fontSize: 12, color: _C.muted, height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  InkWell(
+                    onTap: _uploadingSignature
+                        ? null
+                        : () => _pickAndUploadImage(isSignature: true),
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      height: 110,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: _C.line),
+                      ),
+                      child: _uploadingSignature
+                          ? const Center(
+                        child: SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2.5),
+                        ),
+                      )
+                          : (signatureUrl != null
+                          ? Padding(
+                        padding: const EdgeInsets.all(10),
+                        child: Image.network(
+                          signatureUrl!,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => const Center(
+                            child: Text(
+                              'Could not load signature',
+                              style: TextStyle(
+                                  fontSize: 12, color: _C.muted),
+                            ),
+                          ),
+                        ),
+                      )
+                          : const Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.draw_outlined, color: _C.faint),
+                          SizedBox(height: 4),
+                          Text(
+                            'Tap to upload signature image',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: _C.muted,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      )),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _drawerButton(
+                          icon: Icons.upload_rounded,
+                          label: signatureUrl == null
+                              ? 'Upload signature'
+                              : 'Replace signature',
+                          onPressed: _uploadingSignature
+                              ? null
+                              : () => _pickAndUploadImage(isSignature: true),
+                        ),
+                      ),
+                      if (signatureUrl != null) ...[
+                        const SizedBox(width: 8),
+                        _drawerButton(
+                          icon: Icons.delete_outline_rounded,
+                          label: 'Remove',
+                          danger: true,
+                          onPressed: _uploadingSignature
+                              ? null
+                              : () => _removeImage(isSignature: true),
+                        ),
+                      ],
+                    ],
+                  ),
+
+                  // ----- SECURITY -----
+                  const SizedBox(height: 28),
+                  _drawerSection('Security'),
+                  _buildDrawerLabel('Current password'),
+                  TextField(
+                    controller: _currentPasswordController,
+                    obscureText: _hidePasswords,
+                    decoration: _drawerInputDecoration('Current password',
+                        icon: Icons.lock_outline_rounded, suffix: true),
+                  ),
+                  const SizedBox(height: 12),
+                  _buildDrawerLabel('New password'),
+                  TextField(
+                    controller: _passwordController,
+                    obscureText: _hidePasswords,
+                    decoration: _drawerInputDecoration('At least 6 characters',
+                        icon: Icons.lock_reset_rounded, suffix: true),
+                  ),
+                  const SizedBox(height: 12),
+                  _buildDrawerLabel('Confirm new password'),
+                  TextField(
+                    controller: _confirmPasswordController,
+                    obscureText: _hidePasswords,
+                    decoration: _drawerInputDecoration('Confirm new password',
+                        icon: Icons.lock_reset_rounded, suffix: true),
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: ElevatedButton(
+                      onPressed: _isChangingPassword ? null : _changePassword,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _C.ink,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14)),
+                      ),
+                      child: _isChangingPassword
+                          ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(
+                            color: Colors.white, strokeWidth: 2),
+                      )
+                          : const Text(
+                        'Update password',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w700, fontSize: 15),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                 ],
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _drawerButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onPressed,
+    bool danger = false,
+  }) {
+    final color = danger ? _C.red : _C.blue;
+    return OutlinedButton.icon(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 16, color: onPressed == null ? _C.faint : color),
+      label: Text(
+        label,
+        style: TextStyle(
+          fontSize: 12.5,
+          fontWeight: FontWeight.w700,
+          color: onPressed == null ? _C.faint : color,
+        ),
+        overflow: TextOverflow.ellipsis,
+      ),
+      style: OutlinedButton.styleFrom(
+        minimumSize: const Size(0, 44),
+        side: BorderSide(
+            color: onPressed == null ? _C.line : color.withValues(alpha: 0.4)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
@@ -1278,12 +1721,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  InputDecoration _drawerInputDecoration(String hint, {IconData? icon}) {
+  InputDecoration _drawerInputDecoration(String hint,
+      {IconData? icon, bool suffix = false}) {
     return InputDecoration(
       hintText: hint,
       hintStyle: const TextStyle(color: _C.faint, fontSize: 14),
       prefixIcon:
       icon != null ? Icon(icon, size: 20, color: _C.faint) : null,
+      suffixIcon: suffix
+          ? IconButton(
+        icon: Icon(
+          _hidePasswords
+              ? Icons.visibility_off_outlined
+              : Icons.visibility_outlined,
+          size: 20,
+          color: _C.faint,
+        ),
+        onPressed: () => setState(() => _hidePasswords = !_hidePasswords),
+      )
+          : null,
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
       fillColor: Colors.white,
       filled: true,

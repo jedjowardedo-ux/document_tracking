@@ -37,10 +37,106 @@ class InboxScreen extends StatefulWidget {
 class _InboxScreenState extends State<InboxScreen> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final User? _currentUser = FirebaseAuth.instance.currentUser;
-  String _activeFilter = 'all'; // 'all' or 'overdue'
+  String _activeFilter = 'all'; // 'all' | 'overdue' | 'handled' | 'pickup'
 
   // Dynamic user & office cache to mirror PHP table JOINs
   final Map<String, Future<Map<String, String>>> _uploaderCache = {};
+
+  // Multi-select (long press) for the Handled / Pick-up tabs
+  bool _selectionMode = false;
+  final Set<String> _selected = {};
+
+  void _setFilter(String f) {
+    setState(() {
+      _activeFilter = f;
+      _selectionMode = false;
+      _selected.clear();
+    });
+  }
+
+  void _startSelection(String id) {
+    setState(() {
+      _selectionMode = true;
+      _selected
+        ..clear()
+        ..add(id);
+    });
+  }
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (!_selected.add(id)) _selected.remove(id);
+      if (_selected.isEmpty) _selectionMode = false;
+    });
+  }
+
+  void _exitSelection() {
+    setState(() {
+      _selectionMode = false;
+      _selected.clear();
+    });
+  }
+
+  // Removed from MY lists only; the document itself stays for everyone else
+  bool _isHiddenForMe(Map<String, dynamic> d) {
+    final h = d['hiddenBy'];
+    return h is List && h.contains(_currentUser?.uid);
+  }
+
+  Future<void> _deleteSelected() async {
+    final count = _selected.length;
+    if (count == 0) return;
+    final listName = _activeFilter == 'pickup' ? 'Pick-up' : 'Handled';
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: Text(
+          'Delete $count ${count == 1 ? 'item' : 'items'}?',
+          style: const TextStyle(fontWeight: FontWeight.w800, color: _C.ink),
+        ),
+        content: Text(
+          'They will be removed from your $listName list. The documents themselves are not deleted and still appear in Records.',
+          style: const TextStyle(color: _C.muted, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel', style: TextStyle(color: _C.muted)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _C.red,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    try {
+      final db = FirebaseFirestore.instance;
+      final batch = db.batch();
+      for (final id in _selected) {
+        batch.update(db.collection('documents').doc(id), {
+          'hiddenBy': FieldValue.arrayUnion([_currentUser!.uid]),
+        });
+      }
+      await batch.commit();
+      _exitSelection();
+      _snack('Removed $count ${count == 1 ? 'item' : 'items'}.',
+          color: _C.green);
+    } catch (e) {
+      _snack('Could not delete: $e', color: _C.red);
+    }
+  }
 
   String _getTodayString() {
     final now = DateTime.now();
@@ -56,6 +152,20 @@ class _InboxScreenState extends State<InboxScreen> {
   String? _dueOf(Map<String, dynamic> data) {
     final raw = data['dueDate'] ?? data['due_date'];
     return raw?.toString();
+  }
+
+  // e.g. "APPROVED - PICKED UP" (same wording as Records > Logs)
+  String _statusLabel(Map<String, dynamic> d) {
+    final st = (d['status'] ?? '').toString().toUpperCase();
+    if (d['pickedUp'] == true) return '$st - PICKED UP';
+    if (d['pickupRequested'] == true) return '$st - PICK-UP REQUESTED';
+    return st;
+  }
+
+  // True if [uid] is the original sender of this document
+  bool _isSenderOf(Map<String, dynamic> d, String uid) {
+    return [d['pickupSenderId'], d['senderId'], d['uploaderId'], d['uploader_id']]
+        .contains(uid);
   }
 
   String _formatDue(String dueDate) {
@@ -359,6 +469,43 @@ class _InboxScreenState extends State<InboxScreen> {
     }
   }
 
+  // --- PICK-UP ACTIONS ---
+
+  // Receiver asks the sender to come and pick up the document
+  Future<void> _requestPickup(String docId, Map<String, dynamic> data) async {
+    try {
+      final me = await _getUploaderDetails(_currentUser!.uid, {});
+      final originalSender =
+          data['uploaderId'] ?? data['uploader_id'] ?? data['senderId'];
+      await FirebaseFirestore.instance.collection('documents').doc(docId).update({
+        'pickupRequested': true,
+        'pickedUp': false,
+        'pickupSenderId': originalSender,
+        'pickupRequestedBy': _currentUser!.uid,
+        'pickupRequestedByName': me['name'],
+        'pickupRequestedByOffice': me['office'],
+        'pickupRequestedAt': FieldValue.serverTimestamp(),
+      });
+      _snack('Pick-up requested. The sender has been notified.', color: _C.green);
+    } catch (e) {
+      _snack('Could not request pick-up: $e', color: _C.red);
+    }
+  }
+
+  // Sender confirms they physically picked the document up
+  Future<void> _confirmPickedUp(String docId) async {
+    try {
+      await FirebaseFirestore.instance.collection('documents').doc(docId).update({
+        'pickedUp': true,
+        'pickedUpBy': _currentUser!.uid,
+        'pickedUpAt': FieldValue.serverTimestamp(),
+      });
+      _snack('Marked as picked up.', color: _C.green);
+    } catch (e) {
+      _snack('Could not update: $e', color: _C.red);
+    }
+  }
+
   // --- OTHER ACTIONS ---
 
   Future<void> _processAction(String docId, String newStatus) async {
@@ -453,6 +600,8 @@ class _InboxScreenState extends State<InboxScreen> {
       await FirebaseFirestore.instance.collection('documents').doc(docId).update({
         'status': newStatus,
         'seenBySender': false,
+        'handledBy': FieldValue.arrayUnion([_currentUser!.uid]),
+        'lastAction': newStatus,
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
@@ -840,6 +989,9 @@ class _InboxScreenState extends State<InboxScreen> {
                             'destinationOffice': forwardOffice,
                             'remarks': remarksController.text.trim(),
                             'status': 'pending',
+                            'handledBy':
+                            FieldValue.arrayUnion([_currentUser!.uid]),
+                            'lastAction': 'forwarded',
                             'updatedAt': FieldValue.serverTimestamp(),
                           };
 
@@ -896,105 +1048,153 @@ class _InboxScreenState extends State<InboxScreen> {
 
     final currentUserId = _currentUser!.uid;
 
-    return Scaffold(
-      key: _scaffoldKey,
-      backgroundColor: _C.paper,
-      drawer: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance.collection('documents').snapshots(),
-        builder: (context, notifSnapshot) {
-          int count = 0;
-          if (notifSnapshot.hasData) {
-            for (var doc in notifSnapshot.data!.docs) {
-              final data = doc.data() as Map<String, dynamic>;
-              final isArchived = data['isArchived'] == true;
-              final status = (data['status'] ?? '').toString().toLowerCase();
+    return PopScope(
+      canPop: !_selectionMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _selectionMode) _exitSelection();
+      },
+      child: Scaffold(
+        key: _scaffoldKey,
+        backgroundColor: _C.paper,
+        drawer: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance.collection('documents').snapshots(),
+          builder: (context, notifSnapshot) {
+            int count = 0;
+            if (notifSnapshot.hasData) {
+              for (var doc in notifSnapshot.data!.docs) {
+                final data = doc.data() as Map<String, dynamic>;
+                final isArchived = data['isArchived'] == true;
+                final status = (data['status'] ?? '').toString().toLowerCase();
 
-              if (!isArchived) {
-                final recipientId =
-                    data['recipientId'] ?? data['receiver_user_id'];
-                if (recipientId == currentUserId && status == 'pending') {
-                  count++;
-                }
+                if (!isArchived) {
+                  final recipientId =
+                      data['recipientId'] ?? data['receiver_user_id'];
+                  if (recipientId == currentUserId && status == 'pending') {
+                    count++;
+                  }
 
-                final senderId = data['senderId'] ?? data['uploaderId'];
-                final seenBySender = data['seenBySender'] ?? false;
-                if (senderId == currentUserId &&
-                    (status == 'approved' || status == 'rejected') &&
-                    !seenBySender) {
-                  count++;
+                  final senderId = data['senderId'] ?? data['uploaderId'];
+                  final seenBySender = data['seenBySender'] ?? false;
+                  if (senderId == currentUserId &&
+                      (status == 'approved' || status == 'rejected') &&
+                      !seenBySender) {
+                    count++;
+                  }
+
+                  // Receiver asked me (the sender) to pick up a document
+                  if (_isSenderOf(data, currentUserId) &&
+                      data['pickupRequested'] == true &&
+                      data['pickedUp'] != true) {
+                    count++;
+                  }
                 }
               }
             }
-          }
 
-          return Sidebar(
-            currentPage: 'inbox.php',
-            notificationCount: count,
-          );
-        },
-      ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance.collection('documents').snapshots(),
-        builder: (context, snapshot) {
-          final loading = snapshot.connectionState == ConnectionState.waiting;
+            return Sidebar(
+              currentPage: 'inbox.php',
+              notificationCount: count,
+            );
+          },
+        ),
+        body: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance.collection('documents').snapshots(),
+          builder: (context, snapshot) {
+            final loading = snapshot.connectionState == ConnectionState.waiting;
+            final allDocs =
+            snapshot.hasData ? snapshot.data!.docs : <QueryDocumentSnapshot>[];
+            Map<String, dynamic> m(QueryDocumentSnapshot d) =>
+                d.data() as Map<String, dynamic>;
 
-          // Match backend logic: receiver_user_id == user_id AND status == 'pending' AND is_archived == FALSE
-          List<QueryDocumentSnapshot> pendingDocs = [];
-          if (snapshot.hasData) {
-            pendingDocs = snapshot.data!.docs.where((d) {
-              final data = d.data() as Map<String, dynamic>;
-              final recipientId =
-                  data['recipientId'] ?? data['receiver_user_id'];
+            // Match backend logic: receiver_user_id == user_id AND status == 'pending' AND is_archived == FALSE
+            final pendingDocs = allDocs.where((d) {
+              final data = m(d);
+              final recipientId = data['recipientId'] ?? data['receiver_user_id'];
               final status = (data['status'] ?? '').toString().toLowerCase();
-              final isArchived = data['isArchived'] == true;
-
               return recipientId == currentUserId &&
                   status == 'pending' &&
-                  !isArchived;
+                  data['isArchived'] != true;
             }).toList();
-          }
 
-          final overdueDocs = pendingDocs.where((doc) {
-            final data = doc.data() as Map<String, dynamic>;
-            return _isOverdue(_dueOf(data));
-          }).toList();
+            final overdueDocs =
+            pendingDocs.where((d) => _isOverdue(_dueOf(m(d)))).toList();
 
-          // Client-side overdue filter
-          final docs = List<QueryDocumentSnapshot>.from(
-              _activeFilter == 'overdue' ? overdueDocs : pendingDocs);
+            // Docs I already approved / rejected / forwarded
+            final handledDocs = allDocs.where((d) {
+              final data = m(d);
+              if (data['isArchived'] == true) return false;
+              if (_isHiddenForMe(data)) return false;
+              final by = data['handledBy'];
+              final viaField = by is List && by.contains(currentUserId);
+              final recipientId = data['recipientId'] ?? data['receiver_user_id'];
+              final status = (data['status'] ?? '').toString().toLowerCase();
+              final viaStatus = recipientId == currentUserId &&
+                  (status == 'approved' || status == 'rejected');
+              return viaField || viaStatus;
+            }).toList();
 
-          // Order by updatedAt DESC
-          docs.sort((a, b) {
-            final aData = a.data() as Map<String, dynamic>;
-            final bData = b.data() as Map<String, dynamic>;
-            final aTime =
-            (aData['updatedAt'] ?? aData['createdAt']) as Timestamp?;
-            final bTime =
-            (bData['updatedAt'] ?? bData['createdAt']) as Timestamp?;
-            if (aTime == null || bTime == null) return 0;
-            return bTime.compareTo(aTime);
-          });
+            // Docs where a receiver asked ME (the sender) to pick up
+            final pickupDocs = allDocs.where((d) {
+              final data = m(d);
+              return _isSenderOf(data, currentUserId) &&
+                  data['pickupRequested'] == true &&
+                  !_isHiddenForMe(data) &&
+                  data['isArchived'] != true;
+            }).toList();
 
-          return Column(
-            children: [
-              _buildHeader(pendingDocs.length, overdueDocs.length),
-              Expanded(
-                child: loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : docs.isEmpty
-                    ? _buildEmptyState()
-                    : _buildList(docs),
-              ),
-            ],
-          );
-        },
+            List<QueryDocumentSnapshot> source;
+            switch (_activeFilter) {
+              case 'overdue':
+                source = overdueDocs;
+                break;
+              case 'handled':
+                source = handledDocs;
+                break;
+              case 'pickup':
+                source = pickupDocs;
+                break;
+              default:
+                source = pendingDocs;
+            }
+            final docs = List<QueryDocumentSnapshot>.from(source);
+
+            // Order by updatedAt DESC
+            docs.sort((a, b) {
+              final aTime = (m(a)['updatedAt'] ?? m(a)['createdAt']) as Timestamp?;
+              final bTime = (m(b)['updatedAt'] ?? m(b)['createdAt']) as Timestamp?;
+              if (aTime == null || bTime == null) return 0;
+              return bTime.compareTo(aTime);
+            });
+
+            return Column(
+              children: [
+                _buildHeader(
+                  pendingDocs.length,
+                  overdueDocs.length,
+                  handledDocs.length,
+                  // tab badge counts only requests still waiting for pick-up
+                  pickupDocs.where((d) => m(d)['pickedUp'] != true).length,
+                  docs.map((d) => d.id).toList(),
+                ),
+                Expanded(
+                  child: loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : docs.isEmpty
+                      ? _buildEmptyState()
+                      : _buildList(docs),
+                ),
+              ],
+            );
+          },
+        ),
       ),
     );
   }
 
   // ---------- HEADER ----------
 
-  Widget _buildHeader(int total, int overdue) {
+  Widget _buildHeader(int total, int overdue, int handled, int pickup,
+      List<String> visibleIds) {
     final topPad = MediaQuery.of(context).padding.top;
 
     return Container(
@@ -1014,7 +1214,7 @@ class _InboxScreenState extends State<InboxScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          if (_selectionMode) _selectionBar(visibleIds) else Row(
             children: [
               InkWell(
                 onTap: () => _scaffoldKey.currentState?.openDrawer(),
@@ -1066,7 +1266,7 @@ class _InboxScreenState extends State<InboxScreen> {
           ),
           const SizedBox(height: 18),
 
-          // Filter tabs
+          // Filter tabs (four tabs share the width and scale down to fit)
           Container(
             padding: const EdgeInsets.all(4),
             decoration: BoxDecoration(
@@ -1080,20 +1280,100 @@ class _InboxScreenState extends State<InboxScreen> {
                   label: 'All',
                   count: total,
                   selected: _activeFilter == 'all',
-                  onTap: () => setState(() => _activeFilter = 'all'),
+                  onTap: () => _setFilter('all'),
                 ),
                 _filterTab(
                   label: 'Overdue',
                   count: overdue,
                   selected: _activeFilter == 'overdue',
                   danger: true,
-                  onTap: () => setState(() => _activeFilter = 'overdue'),
+                  onTap: () => _setFilter('overdue'),
+                ),
+                _filterTab(
+                  label: 'Handled',
+                  count: handled,
+                  selected: _activeFilter == 'handled',
+                  onTap: () => _setFilter('handled'),
+                ),
+                _filterTab(
+                  label: 'Pick-up',
+                  count: pickup,
+                  selected: _activeFilter == 'pickup',
+                  onTap: () => _setFilter('pickup'),
                 ),
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _selectionBar(List<String> visibleIds) {
+    final allSelected =
+        visibleIds.isNotEmpty && visibleIds.every(_selected.contains);
+
+    return Row(
+      children: [
+        InkWell(
+          onTap: _exitSelection,
+          borderRadius: BorderRadius.circular(14),
+          child: Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.14)),
+            ),
+            child: const Icon(Icons.close_rounded,
+                color: Colors.white, size: 22),
+          ),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Text(
+            '${_selected.length} selected',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.3,
+            ),
+          ),
+        ),
+        TextButton(
+          onPressed: () => setState(() {
+            if (allSelected) {
+              _selected.clear();
+            } else {
+              _selected
+                ..clear()
+                ..addAll(visibleIds);
+            }
+          }),
+          child: Text(
+            allSelected ? 'Deselect all' : 'Select all',
+            style: const TextStyle(
+                color: Colors.white, fontWeight: FontWeight.w700, fontSize: 13),
+          ),
+        ),
+        const SizedBox(width: 4),
+        InkWell(
+          onTap: _selected.isEmpty ? null : _deleteSelected,
+          borderRadius: BorderRadius.circular(14),
+          child: Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: _C.red.withValues(alpha: _selected.isEmpty ? 0.35 : 0.9),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: const Icon(Icons.delete_outline_rounded,
+                color: Colors.white, size: 22),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1112,54 +1392,57 @@ class _InboxScreenState extends State<InboxScreen> {
         behavior: HitTestBehavior.opaque,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 180),
-          padding: const EdgeInsets.symmetric(vertical: 10),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
           decoration: BoxDecoration(
             color: selected ? Colors.white : Colors.transparent,
             borderRadius: BorderRadius.circular(12),
           ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (danger) ...[
-                Icon(
-                  Icons.schedule_rounded,
-                  size: 15,
-                  color: selected
-                      ? selectedText
-                      : Colors.white.withValues(alpha: 0.75),
-                ),
-                const SizedBox(width: 5),
-              ],
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                  color: selected
-                      ? selectedText
-                      : Colors.white.withValues(alpha: 0.75),
-                ),
-              ),
-              const SizedBox(width: 7),
-              Container(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
-                decoration: BoxDecoration(
-                  color: selected
-                      ? selectedText.withValues(alpha: 0.12)
-                      : Colors.white.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  '$count',
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (danger) ...[
+                  Icon(
+                    Icons.schedule_rounded,
+                    size: 15,
+                    color: selected
+                        ? selectedText
+                        : Colors.white.withValues(alpha: 0.75),
+                  ),
+                  const SizedBox(width: 5),
+                ],
+                Text(
+                  label,
                   style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w800,
-                    color: selected ? selectedText : Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: selected
+                        ? selectedText
+                        : Colors.white.withValues(alpha: 0.75),
                   ),
                 ),
-              ),
-            ],
+                const SizedBox(width: 7),
+                Container(
+                  padding:
+                  const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
+                  decoration: BoxDecoration(
+                    color: selected
+                        ? selectedText.withValues(alpha: 0.12)
+                        : Colors.white.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    '$count',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      color: selected ? selectedText : Colors.white,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1169,7 +1452,23 @@ class _InboxScreenState extends State<InboxScreen> {
   // ---------- LIST ----------
 
   Widget _buildEmptyState() {
-    final overdueView = _activeFilter == 'overdue';
+    final f = _activeFilter;
+    final overdueView = f == 'overdue';
+
+    final title = f == 'overdue'
+        ? 'Nothing is overdue'
+        : f == 'handled'
+        ? 'No handled documents yet'
+        : f == 'pickup'
+        ? 'No pick-up requests'
+        : 'Your inbox is clear';
+    final sub = f == 'overdue'
+        ? 'All your pending documents are within their due dates.'
+        : f == 'handled'
+        ? 'Documents you approve, reject or forward appear here.'
+        : f == 'pickup'
+        ? 'When a receiver asks you to pick up a document, it shows here.'
+        : 'New documents sent to you will show up here.';
 
     return Center(
       child: Padding(
@@ -1196,7 +1495,7 @@ class _InboxScreenState extends State<InboxScreen> {
             ),
             const SizedBox(height: 18),
             Text(
-              overdueView ? 'Nothing is overdue' : 'Your inbox is clear',
+              title,
               style: const TextStyle(
                 fontSize: 17,
                 fontWeight: FontWeight.w800,
@@ -1205,9 +1504,7 @@ class _InboxScreenState extends State<InboxScreen> {
             ),
             const SizedBox(height: 6),
             Text(
-              overdueView
-                  ? 'All your pending documents are within their due dates.'
-                  : 'New documents sent to you will show up here.',
+              sub,
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 13, color: _C.muted, height: 1.4),
             ),
@@ -1231,12 +1528,18 @@ class _InboxScreenState extends State<InboxScreen> {
         return FutureBuilder<Map<String, String>>(
           future: _getUploaderDetails(uploaderId, data),
           builder: (context, detailsSnapshot) {
-            final uploaderName = detailsSnapshot.data?['name'] ??
+            var uploaderName = detailsSnapshot.data?['name'] ??
                 data['senderName'] ??
                 'Loading...';
-            final senderOffice = detailsSnapshot.data?['office'] ??
+            var senderOffice = detailsSnapshot.data?['office'] ??
                 data['destinationOffice'] ??
                 'General Office';
+
+            // In the Pick-up tab show WHO is waiting for the sender
+            if (_activeFilter == 'pickup') {
+              uploaderName = data['pickupRequestedByName'] ?? 'Receiver';
+              senderOffice = data['pickupRequestedByOffice'] ?? '';
+            }
 
             return _buildDocCard(doc.id, data, uploaderName.toString(),
                 senderOffice.toString());
@@ -1255,167 +1558,284 @@ class _InboxScreenState extends State<InboxScreen> {
         'Untitled Document')
         .toString();
     final dueDate = _dueOf(data);
-    final late = _isOverdue(dueDate);
+    // Overdue styling only applies to pending cards
+    final late = (_activeFilter == 'all' || _activeFilter == 'overdue') &&
+        _isOverdue(dueDate);
     final description = data['description']?.toString() ?? '';
     final accent = late ? _C.red : _C.blue;
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: late ? const Color(0xFFF3C4C4) : _C.line),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: IntrinsicHeight(
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Status rail
-            Container(width: 5, color: accent),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Sender row
-                    Row(
+    // Long press to select is only available in Handled / Pick-up
+    final canSelect = _activeFilter == 'handled' || _activeFilter == 'pickup';
+    final selecting = _selectionMode && canSelect;
+    final isSelected = _selected.contains(docId);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onLongPress:
+      canSelect && !_selectionMode ? () => _startSelection(docId) : null,
+      onTap: selecting ? () => _toggleSelect(docId) : null,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: isSelected
+                ? _C.blue
+                : (late ? const Color(0xFFF3C4C4) : _C.line),
+            width: isSelected ? 1.6 : 1,
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Selection check mark (left side)
+              if (selecting)
+                Container(
+                  width: 46,
+                  color: isSelected ? const Color(0xFFE8F0FE) : _C.paper,
+                  alignment: Alignment.center,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    width: 24,
+                    height: 24,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: isSelected ? _C.blue : Colors.white,
+                      border: Border.all(
+                          color: isSelected ? _C.blue : _C.faint, width: 1.6),
+                    ),
+                    child: isSelected
+                        ? const Icon(Icons.check_rounded,
+                        size: 16, color: Colors.white)
+                        : null,
+                  ),
+                ),
+              // Status rail
+              Container(width: 5, color: accent),
+              Expanded(
+                child: IgnorePointer(
+                  ignoring: selecting,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        CircleAvatar(
-                          radius: 19,
-                          backgroundColor: const Color(0xFFE8F0FE),
-                          child: Text(
-                            uploaderName.isNotEmpty
-                                ? uploaderName[0].toUpperCase()
-                                : 'U',
+                        // Sender row
+                        Row(
+                          children: [
+                            CircleAvatar(
+                              radius: 19,
+                              backgroundColor: const Color(0xFFE8F0FE),
+                              child: Text(
+                                uploaderName.isNotEmpty
+                                    ? uploaderName[0].toUpperCase()
+                                    : 'U',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w800, color: _C.blue),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    uploaderName,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 14,
+                                      color: _C.text,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  Text(
+                                    senderOffice,
+                                    style: const TextStyle(
+                                        fontSize: 12, color: _C.muted),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (late)
+                              _dueChip('Overdue', _C.red, const Color(0xFFFBEAEA))
+                            else if (dueDate != null && dueDate.isNotEmpty)
+                              _dueChip('Due ${_formatDue(dueDate)}', _C.muted,
+                                  _C.paper),
+                          ],
+                        ),
+                        const SizedBox(height: 14),
+
+                        // Title + description
+                        Text(
+                          title,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: 16,
+                            color: _C.ink,
+                            letterSpacing: -0.2,
+                          ),
+                        ),
+                        if (description.isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            description,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
-                                fontWeight: FontWeight.w800, color: _C.blue),
+                                fontSize: 13, color: _C.muted, height: 1.4),
                           ),
+                        ],
+                        const SizedBox(height: 12),
+
+                        // Utility actions
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _utilityChip(
+                              icon: Icons.info_outline_rounded,
+                              label: 'Details',
+                              onTap: () =>
+                                  _showDetailsDialog(data, uploaderName, senderOffice),
+                            ),
+                            _utilityChip(
+                              icon: Icons.visibility_outlined,
+                              label: 'Preview',
+                              onTap: () => _quickViewDocument(data),
+                            ),
+                            _utilityChip(
+                              icon: Icons.download_outlined,
+                              label: 'Download',
+                              onTap: () => _downloadDocument(data),
+                            ),
+                          ],
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                uploaderName,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 14,
-                                  color: _C.text,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              Text(
-                                senderOffice,
-                                style: const TextStyle(
-                                    fontSize: 12, color: _C.muted),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
-                          ),
-                        ),
-                        if (late)
-                          _dueChip('Overdue', _C.red, const Color(0xFFFBEAEA))
-                        else if (dueDate != null && dueDate.isNotEmpty)
-                          _dueChip('Due ${_formatDue(dueDate)}', _C.muted,
-                              _C.paper),
+                        const SizedBox(height: 14),
+
+                        // Footer: decisions / pick-up (depends on the active tab)
+                        ..._buildFooter(docId, data),
                       ],
                     ),
-                    const SizedBox(height: 14),
-
-                    // Title + description
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w800,
-                        fontSize: 16,
-                        color: _C.ink,
-                        letterSpacing: -0.2,
-                      ),
-                    ),
-                    if (description.isNotEmpty) ...[
-                      const SizedBox(height: 4),
-                      Text(
-                        description,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                            fontSize: 13, color: _C.muted, height: 1.4),
-                      ),
-                    ],
-                    const SizedBox(height: 12),
-
-                    // Utility actions
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _utilityChip(
-                          icon: Icons.info_outline_rounded,
-                          label: 'Details',
-                          onTap: () =>
-                              _showDetailsDialog(data, uploaderName, senderOffice),
-                        ),
-                        _utilityChip(
-                          icon: Icons.visibility_outlined,
-                          label: 'Preview',
-                          onTap: () => _quickViewDocument(data),
-                        ),
-                        _utilityChip(
-                          icon: Icons.download_outlined,
-                          label: 'Download',
-                          onTap: () => _downloadDocument(data),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    const Divider(height: 1, color: _C.line),
-                    const SizedBox(height: 14),
-
-                    // Decision actions
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _decisionButton(
-                            icon: Icons.close_rounded,
-                            label: 'Reject',
-                            color: _C.red,
-                            onTap: () => _processAction(docId, 'rejected'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _decisionButton(
-                            icon: Icons.send_rounded,
-                            label: 'Forward',
-                            color: _C.blue,
-                            onTap: () => _openForwardModal(docId),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _decisionButton(
-                            icon: Icons.check_rounded,
-                            label: 'Approve',
-                            color: _C.green,
-                            filled: true,
-                            onTap: () => _processAction(docId, 'approved'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  List<Widget> _buildFooter(String docId, Map<String, dynamic> data) {
+    final requested = data['pickupRequested'] == true;
+    final pickedUp = data['pickedUp'] == true;
+
+    // SENDER: confirm pick-up
+    if (_activeFilter == 'pickup') {
+      return [
+        Text('Status: ${_statusLabel(data)}',
+            style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: pickedUp ? _C.green : _C.muted)),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: _decisionButton(
+            icon: pickedUp
+                ? Icons.check_circle_outline_rounded
+                : Icons.inventory_2_outlined,
+            label: pickedUp ? 'Already picked up' : 'Picked up',
+            color: _C.green,
+            filled: !pickedUp,
+            onTap: pickedUp ? null : () => _confirmPickedUp(docId),
+          ),
+        ),
+      ];
+    }
+
+    // RECEIVER: request pick-up after acting
+    if (_activeFilter == 'handled') {
+      return [
+        Text('Status: ${_statusLabel(data)}',
+            style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: pickedUp ? _C.green : _C.muted)),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: _decisionButton(
+            icon: pickedUp
+                ? Icons.check_circle_outline_rounded
+                : Icons.inventory_2_outlined,
+            label: pickedUp
+                ? 'Picked up by sender'
+                : requested
+                ? 'Pick-up requested'
+                : 'Request pick up',
+            color: _C.blue,
+            filled: !requested && !pickedUp,
+            onTap: (requested || pickedUp)
+                ? null
+                : () => _requestPickup(docId, data),
+          ),
+        ),
+      ];
+    }
+
+    // PENDING: decisions + locked pick-up button
+    return [
+      const Divider(height: 1, color: _C.line),
+      const SizedBox(height: 14),
+      Row(
+        children: [
+          Expanded(
+            child: _decisionButton(
+              icon: Icons.close_rounded,
+              label: 'Reject',
+              color: _C.red,
+              onTap: () => _processAction(docId, 'rejected'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _decisionButton(
+              icon: Icons.send_rounded,
+              label: 'Forward',
+              color: _C.blue,
+              onTap: () => _openForwardModal(docId),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _decisionButton(
+              icon: Icons.check_rounded,
+              label: 'Approve',
+              color: _C.green,
+              filled: true,
+              onTap: () => _processAction(docId, 'approved'),
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      SizedBox(
+        width: double.infinity,
+        child: _decisionButton(
+          icon: Icons.lock_outline_rounded,
+          label: 'Request pick up (after action)',
+          color: _C.blue,
+          onTap: null, // disabled until an action is taken
+        ),
+      ),
+    ];
   }
 
   Widget _dueChip(String label, Color fg, Color bg) {
@@ -1469,7 +1889,7 @@ class _InboxScreenState extends State<InboxScreen> {
     required IconData icon,
     required String label,
     required Color color,
-    required VoidCallback onTap,
+    required VoidCallback? onTap,
     bool filled = false,
   }) {
     return SizedBox(

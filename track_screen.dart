@@ -100,12 +100,16 @@ class _TrackScreenState extends State<TrackScreen> {
     return '${months[dt.month - 1]} ${dt.day.toString().padLeft(2, '0')}, ${dt.year} $hour:$minute $period';
   }
 
+  // ---------- STATUS HELPERS ----------
+
   Color _getStatusColor(String? status) {
     switch (status?.toLowerCase()) {
       case 'approved':
         return _C.green;
       case 'rejected':
         return _C.red;
+      case 'forwarded':
+        return _C.blue;
       case 'pending':
         return const Color(0xFFB7791F);
       default:
@@ -119,6 +123,8 @@ class _TrackScreenState extends State<TrackScreen> {
         return const Color(0xFFE6F5EE);
       case 'rejected':
         return const Color(0xFFFBEAEA);
+      case 'forwarded':
+        return const Color(0xFFE8F0FE);
       case 'pending':
         return const Color(0xFFFCF3DC);
       default:
@@ -132,6 +138,8 @@ class _TrackScreenState extends State<TrackScreen> {
         return Icons.check_rounded;
       case 'rejected':
         return Icons.close_rounded;
+      case 'forwarded':
+        return Icons.forward_rounded;
       case 'pending':
         return Icons.schedule_rounded;
       default:
@@ -143,6 +151,21 @@ class _TrackScreenState extends State<TrackScreen> {
     final s = (status ?? 'pending');
     if (s.isEmpty) return 'Pending';
     return s[0].toUpperCase() + s.substring(1).toLowerCase();
+  }
+
+  String _stepVerb(String status) {
+    switch (status) {
+      case 'pending':
+        return 'Waiting with';
+      case 'forwarded':
+        return 'Forwarded to';
+      case 'approved':
+        return 'Approved by';
+      case 'rejected':
+        return 'Rejected by';
+      default:
+        return 'With';
+    }
   }
 
   Widget _statusChip(String? status) {
@@ -624,8 +647,7 @@ class _TrackScreenState extends State<TrackScreen> {
                               ),
                               onPressed: () => Navigator.pop(ctx),
                               child: const Text('Close',
-                                  style:
-                                  TextStyle(fontWeight: FontWeight.w700)),
+                                  style: TextStyle(fontWeight: FontWeight.w700)),
                             ),
                           ),
                         ],
@@ -836,7 +858,8 @@ class _TrackScreenState extends State<TrackScreen> {
                       doc.id;
                   return DropdownMenuItem<String>(
                     value: doc.id,
-                    child: Text(title.toString(), overflow: TextOverflow.ellipsis),
+                    child:
+                    Text(title.toString(), overflow: TextOverflow.ellipsis),
                   );
                 }).toList(),
                 onChanged: (val) {
@@ -888,6 +911,33 @@ class _TrackScreenState extends State<TrackScreen> {
         ),
       ),
     );
+  }
+
+  // ---------- HISTORY (mirrors document_history rows) ----------
+
+  int _ms(Timestamp? t) =>
+      t?.millisecondsSinceEpoch ?? DateTime.now().millisecondsSinceEpoch;
+
+  // One entry per history row, newest first (ORDER BY moved_at DESC)
+  List<Map<String, dynamic>> _buildHistory(List<QueryDocumentSnapshot> docs) {
+    final logs = <Map<String, dynamic>>[];
+    for (final d in docs) {
+      final m = d.data() as Map<String, dynamic>;
+      logs.add({
+        'id': d.id,
+        'status': ((m['status'] as String?) ?? 'pending').toLowerCase(),
+        'at': (m['movedAt'] ?? m['moved_at'] ?? m['createdAt']) as Timestamp?,
+        'senderId': (m['senderId'] ?? m['sender_id']) as String?,
+        'receiverId': (m['receiverId'] ??
+            m['receiver_id'] ??
+            m['recipientId'] ??
+            m['receiver_user_id']) as String?,
+        'remarks': ((m['remarks'] as String?) ?? '').trim(),
+      });
+    }
+    logs.sort((a, b) =>
+        _ms(b['at'] as Timestamp?).compareTo(_ms(a['at'] as Timestamp?)));
+    return logs;
   }
 
   // ---------- TIMELINE ----------
@@ -995,122 +1045,30 @@ class _TrackScreenState extends State<TrackScreen> {
                     .collection('history')
                     .snapshots(),
                 builder: (context, historySnapshot) {
-                  final List<Map<String, dynamic>> rawLogs = [];
+                  final logs =
+                  _buildHistory(historySnapshot.data?.docs ?? []);
 
-                  // 1. Gather historical logs
-                  if (historySnapshot.hasData &&
-                      historySnapshot.data!.docs.isNotEmpty) {
-                    for (var logDoc in historySnapshot.data!.docs) {
-                      rawLogs.add(Map<String, dynamic>.from(
-                          logDoc.data() as Map<String, dynamic>));
-                    }
+                  if (historySnapshot.connectionState ==
+                      ConnectionState.waiting &&
+                      logs.isEmpty) {
+                    return const Center(child: CircularProgressIndicator());
                   }
 
-                  // 2. Current top-level document snapshot
-                  final docStatus = (docData['status'] as String?) ?? 'pending';
-                  final docUpdatedAt = (docData['updatedAt'] as Timestamp?) ??
-                      (docData['createdAt'] as Timestamp?);
-                  final docSender = (docData['uploaderId'] ??
-                      docData['uploader_id'] ??
-                      docData['senderId'] ??
-                      docData['sender_id']) as String?;
-                  final docReceiver = (docData['recipientId'] ??
-                      docData['receiver_user_id']) as String?;
-                  final docOffice = (docData['destinationOffice'] ??
-                      docData['senderOffice'] ??
-                      '') as String?;
-                  final docRemarks =
-                  (docData['remarks'] as String?)?.trim().isNotEmpty == true
-                      ? docData['remarks'] as String
-                      : 'Document status: ${docStatus.toUpperCase()}';
-
-                  final topLog = {
-                    'status': docStatus,
-                    'movedAt': docUpdatedAt,
-                    'senderId': docSender,
-                    'receiverId': docReceiver,
-                    'destinationOffice': docOffice,
-                    'remarks': docRemarks,
-                  };
-
-                  if (rawLogs.isEmpty) {
-                    rawLogs.add(topLog);
-                  } else {
-                    final lastReceiver =
-                        rawLogs.last['receiverId'] ?? rawLogs.last['recipientId'];
-                    final lastStatus = rawLogs.last['status'];
-
-                    if (lastStatus != docStatus || lastReceiver != docReceiver) {
-                      rawLogs.add(topLog);
-                    }
+                  if (logs.isEmpty) {
+                    return const Center(
+                      child: Text('No movement recorded for this document yet.',
+                          style: TextStyle(color: _C.muted)),
+                    );
                   }
-
-                  // 3. Sort chronologically ASCENDING (Oldest -> Newest)
-                  rawLogs.sort((a, b) {
-                    final aTime = (a['movedAt'] ?? a['createdAt']) as Timestamp?;
-                    final bTime = (b['movedAt'] ?? b['createdAt']) as Timestamp?;
-                    if (aTime == null || bTime == null) return 0;
-                    return aTime.compareTo(bTime);
-                  });
-
-                  // 4. Sequential Chaining: User1 -> User2 -> User3
-                  String? previousRecipientId;
-
-                  for (int i = 0; i < rawLogs.length; i++) {
-                    final log = rawLogs[i];
-                    final currentReceiver = (log['receiverId'] ??
-                        log['recipientId'] ??
-                        log['receiver_user_id']) as String?;
-
-                    String? currentSender = (log['senderId'] ??
-                        log['uploaderId'] ??
-                        log['uploader_id'] ??
-                        log['sender_id']) as String?;
-
-                    if (i > 0 &&
-                        previousRecipientId != null &&
-                        previousRecipientId.isNotEmpty) {
-                      currentSender = previousRecipientId;
-                    }
-
-                    log['chainedSenderId'] = currentSender;
-                    log['chainedReceiverId'] = currentReceiver ?? currentSender;
-
-                    if (currentReceiver != null && currentReceiver.isNotEmpty) {
-                      previousRecipientId = currentReceiver;
-                    }
-                  }
-
-                  // 5. Reverse list so latest activity is at top
-                  final displayLogs = rawLogs.reversed.toList();
 
                   return ListView.builder(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
-                    itemCount: displayLogs.length + 1,
-                    itemBuilder: (context, index) {
-                      if (index == 0) {
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 14, left: 2),
-                          child: Text(
-                            displayLogs.length == 1
-                                ? '1 step so far'
-                                : '${displayLogs.length} steps so far, newest first',
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              color: _C.muted,
-                            ),
-                          ),
-                        );
-                      }
-
-                      final i = index - 1;
-                      return _buildTimelineItem(
-                        log: displayLogs[i],
-                        isFirst: i == 0,
-                        isLast: i == displayLogs.length - 1,
-                      );
-                    },
+                    itemCount: logs.length,
+                    itemBuilder: (context, i) => _buildTimelineItem(
+                      log: logs[i],
+                      isFirst: i == 0,
+                      isLast: i == logs.length - 1,
+                    ),
                   );
                 },
               ),
@@ -1126,24 +1084,18 @@ class _TrackScreenState extends State<TrackScreen> {
     required bool isFirst,
     required bool isLast,
   }) {
-    final status = (log['status'] as String?) ?? 'pending';
-    final remarks = (log['remarks'] as String?)?.trim().isNotEmpty == true
-        ? log['remarks'] as String
-        : 'No remarks recorded.';
-    final movedAt = log['movedAt'] as Timestamp?;
-
-    final senderId = log['chainedSenderId'] as String?;
-    final receiverId = log['chainedReceiverId'] as String?;
-    final fallbackOffice =
-        (log['destinationOffice'] as String?) ?? (log['office'] as String?) ?? '';
-
-    final statusColor = _getStatusColor(status);
+    final status = log['status'] as String;
+    final remarks = log['remarks'] as String;
+    final senderId = log['senderId'] as String?;
+    final receiverId = log['receiverId'] as String?;
+    final hasReceiver = receiverId != null && receiverId.isNotEmpty;
+    final color = _getStatusColor(status);
 
     return IntrinsicHeight(
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Timeline rail
+          // Rail
           SizedBox(
             width: 32,
             child: Column(
@@ -1152,27 +1104,26 @@ class _TrackScreenState extends State<TrackScreen> {
                   width: 32,
                   height: 32,
                   decoration: BoxDecoration(
-                    color: isFirst ? statusColor : _getStatusTint(status),
+                    color: isFirst ? color : _getStatusTint(status),
                     shape: BoxShape.circle,
                     border: Border.all(
-                      color: isFirst ? Colors.white : statusColor.withValues(alpha: 0.4),
+                      color: isFirst
+                          ? Colors.white
+                          : color.withValues(alpha: 0.4),
                       width: isFirst ? 3 : 1.5,
                     ),
                     boxShadow: isFirst
                         ? [
                       BoxShadow(
-                        color: statusColor.withValues(alpha: 0.35),
+                        color: color.withValues(alpha: 0.35),
                         blurRadius: 10,
                         spreadRadius: 1,
                       )
                     ]
                         : null,
                   ),
-                  child: Icon(
-                    _getStatusIcon(status),
-                    size: 16,
-                    color: isFirst ? Colors.white : statusColor,
-                  ),
+                  child: Icon(_getStatusIcon(status),
+                      size: 16, color: isFirst ? Colors.white : color),
                 ),
                 if (!isLast)
                   Expanded(
@@ -1212,7 +1163,7 @@ class _TrackScreenState extends State<TrackScreen> {
                       _statusChip(status),
                       Flexible(
                         child: Text(
-                          _formatTimestamp(movedAt),
+                          _formatTimestamp(log['at'] as Timestamp?),
                           style: const TextStyle(
                               fontSize: 11,
                               color: _C.muted,
@@ -1224,23 +1175,17 @@ class _TrackScreenState extends State<TrackScreen> {
                   ),
                   const SizedBox(height: 14),
 
-                  // From / To
+                  // From (sender + office) -> To (receiver + office)
                   FutureBuilder<List<UserDetails>>(
                     future: Future.wait([
                       _getUserDetails(senderId),
                       _getUserDetails(receiverId),
                     ]),
-                    builder: (context, userSnapshot) {
-                      final sender = userSnapshot.data?[0] ??
+                    builder: (context, snap) {
+                      final sender = snap.data?[0] ??
                           UserDetails(name: senderId ?? 'System', office: '');
-                      final receiver = userSnapshot.data?[1] ??
-                          UserDetails(
-                              name: receiverId ?? 'N/A', office: fallbackOffice);
-
-                      final receiverWithOffice = receiver.office.isNotEmpty
-                          ? receiver
-                          : UserDetails(
-                          name: receiver.name, office: fallbackOffice);
+                      final receiver = snap.data?[1] ??
+                          UserDetails(name: receiverId ?? 'N/A', office: '');
 
                       return Column(
                         children: [
@@ -1250,53 +1195,53 @@ class _TrackScreenState extends State<TrackScreen> {
                             color: _C.blue,
                             tint: const Color(0xFFE8F0FE),
                           ),
-                          Padding(
-                            padding: const EdgeInsets.only(left: 16),
-                            child: Align(
-                              alignment: Alignment.centerLeft,
-                              child: Container(
-                                width: 2,
-                                height: 14,
-                                color: _C.line,
+                          if (hasReceiver) ...[
+                            Padding(
+                              padding: const EdgeInsets.only(left: 16),
+                              child: Align(
+                                alignment: Alignment.centerLeft,
+                                child: Container(
+                                    width: 2, height: 14, color: _C.line),
                               ),
                             ),
-                          ),
-                          _participantRow(
-                            label: 'To',
-                            user: receiverWithOffice,
-                            color: _C.green,
-                            tint: const Color(0xFFE6F5EE),
-                          ),
+                            _participantRow(
+                              label: 'To',
+                              user: receiver,
+                              color: _C.green,
+                              tint: const Color(0xFFE6F5EE),
+                            ),
+                          ],
                         ],
                       );
                     },
                   ),
-                  const SizedBox(height: 14),
 
-                  // Remarks
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: _C.paper,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.format_quote_rounded,
-                            size: 18, color: _C.faint),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            remarks,
-                            style: const TextStyle(
-                                fontSize: 12.5, color: _C.text, height: 1.4),
+                  if (remarks.isNotEmpty) ...[
+                    const SizedBox(height: 14),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: _C.paper,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.format_quote_rounded,
+                              size: 18, color: _C.faint),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              remarks,
+                              style: const TextStyle(
+                                  fontSize: 12.5, color: _C.text, height: 1.4),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
+                  ],
                 ],
               ),
             ),
