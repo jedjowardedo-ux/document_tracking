@@ -176,6 +176,9 @@ class _RecordsScreenState extends State<RecordsScreen> {
   String? _activeFolderId;
   String? _activeFolderName;
 
+  // Office of the signed-in user. Decides which folders they can see/create.
+  String? _myOffice;
+
   late Stream<List<RegistryRecord>> _recordsStream;
 
   // Everything in the current tab + search (all pages). Used by Print log.
@@ -193,6 +196,12 @@ class _RecordsScreenState extends State<RecordsScreen> {
     _activeFolderId = widget.folderId;
     _activeFolderName = widget.folderName;
     _recordsStream = _buildStream(_currentType);
+    _loadMyOffice();
+  }
+
+  Future<void> _loadMyOffice() async {
+    final me = await _lookup('users', _uid, _userCache);
+    if (mounted) setState(() => _myOffice = _officeOf(me));
   }
 
   // ---------- DATA ----------
@@ -450,10 +459,234 @@ class _RecordsScreenState extends State<RecordsScreen> {
     return DateFormat(format).format(date);
   }
 
+  // ---------- FOLDERS (office-based) ----------
+
+  // Only folders created by someone in MY office. Folders from other
+  // offices are never loaded, so they can't be seen or picked.
+  Stream<List<FolderItem>> _officeFolders() {
+    final office = _myOffice;
+    if (office == null) return Stream.value(<FolderItem>[]);
+    return FirebaseFirestore.instance
+        .collection('folders')
+        .where('officeName', isEqualTo: office)
+        .snapshots()
+        .map((s) {
+      final list = s.docs.map((d) => FolderItem.fromFirestore(d)).toList();
+      list.sort(
+              (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      return list;
+    });
+  }
+
+  // Dialog to create a new folder for my office
+  void _openCreateFolderModal() {
+    final nameCtrl = TextEditingController();
+    final locCtrl = TextEditingController();
+
+    InputDecoration deco(String hint) => InputDecoration(
+      hintText: hint,
+      hintStyle: const TextStyle(fontSize: 13, color: _C.faint),
+      filled: true,
+      fillColor: _C.paper,
+      contentPadding:
+      const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide.none,
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(color: _C.blue, width: 1.5),
+      ),
+    );
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+          titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+          contentPadding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+          title: _dialogTitle(
+            Icons.create_new_folder_outlined,
+            _C.blue,
+            const Color(0xFFE8F0FE),
+            "New folder",
+            "Visible to everyone in ${_myOffice ?? 'your office'}",
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: deco("Folder name"),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: locCtrl,
+                  decoration: deco("Location (e.g. Vault-A, Cabinet 2)"),
+                ),
+              ],
+            ),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+          actions: [
+            OutlinedButton(
+              style: _cancelStyle(),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text("Cancel",
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            ElevatedButton(
+              style: _primaryStyle(_C.ink),
+              onPressed: () async {
+                final name = nameCtrl.text.trim();
+                final loc = locCtrl.text.trim();
+                final office = _myOffice;
+
+                if (name.isEmpty) {
+                  _styledSnack(context, "Please enter a folder name");
+                  return;
+                }
+                if (office == null) {
+                  _styledSnack(context, "Your account has no office set.",
+                      color: _C.red);
+                  return;
+                }
+
+                try {
+                  final db = FirebaseFirestore.instance;
+
+                  // No duplicate names inside the same office
+                  final existing = await db
+                      .collection('folders')
+                      .where('officeName', isEqualTo: office)
+                      .get();
+                  final taken = existing.docs.any((d) =>
+                  (d.data()['folder_name'] ?? '')
+                      .toString()
+                      .trim()
+                      .toLowerCase() ==
+                      name.toLowerCase());
+                  if (taken) {
+                    if (mounted) {
+                      _styledSnack(this.context,
+                          "Your office already has a folder named \"$name\".",
+                          color: _C.red);
+                    }
+                    return;
+                  }
+
+                  await db.collection('folders').add({
+                    'folder_name': name,
+                    'location': loc.isEmpty ? 'Vault-A' : loc,
+                    'officeName': office,
+                    'createdBy': _uid,
+                    'createdAt': FieldValue.serverTimestamp(),
+                  });
+
+                  if (dialogContext.mounted) Navigator.pop(dialogContext);
+                  if (mounted) {
+                    _styledSnack(this.context, "Folder created.",
+                        color: _C.green);
+                  }
+                } catch (e) {
+                  if (mounted) {
+                    _styledSnack(this.context, "Could not create folder: $e",
+                        color: _C.red);
+                  }
+                }
+              },
+              child: const Text("Create",
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Folder chips shown on the Filing tab (my office's folders only)
+  Widget _buildFolderBar() {
+    return StreamBuilder<List<FolderItem>>(
+      stream: _officeFolders(),
+      builder: (context, snap) {
+        final folders = snap.data ?? <FolderItem>[];
+
+        Widget chip(String label, bool selected, VoidCallback onTap,
+            {IconData icon = Icons.folder_outlined}) {
+          return Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(20),
+              child: Container(
+                padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                decoration: BoxDecoration(
+                  color: selected ? _C.ink : Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: selected ? _C.ink : _C.line),
+                ),
+                child: Row(
+                  children: [
+                    Icon(icon,
+                        size: 15, color: selected ? Colors.white : _C.muted),
+                    const SizedBox(width: 6),
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: selected ? Colors.white : _C.text,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        return SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              chip(
+                "Unfiled",
+                _activeFolderId == null,
+                    () => setState(() {
+                  _activeFolderId = null;
+                  _activeFolderName = null;
+                  _currentPage = 1;
+                }),
+                icon: Icons.inbox_outlined,
+              ),
+              ...folders.map((f) => chip(
+                f.name,
+                _activeFolderId == f.id,
+                    () => setState(() {
+                  _activeFolderId = f.id;
+                  _activeFolderName = f.name;
+                  _currentPage = 1;
+                }),
+              )),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   // ---------- PRINT ----------
 
   // Edit this to the real campus address
-  static const _addressLine = '[Address, Zip Code, Bohol, Philippines]';
+  static const _addressLine = 'Cogtong, Candijay, 6312, Bohol, Philippines';
 
   // Title under the header, follows the active tab
   String get _printTitle {
@@ -944,7 +1177,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
     );
   }
 
-  // Dialog to assign/move document to a folder
+  // Dialog to assign/move document to a folder (my office's folders only)
   void _openMoveModal(String docId) {
     String? selectedFolderId;
 
@@ -967,9 +1200,8 @@ class _RecordsScreenState extends State<RecordsScreen> {
                 "Move to folder",
                 "Relocate document within registry",
               ),
-              content: StreamBuilder<QuerySnapshot>(
-                stream:
-                FirebaseFirestore.instance.collection('folders').snapshots(),
+              content: StreamBuilder<List<FolderItem>>(
+                stream: _officeFolders(),
                 builder: (context, snapshot) {
                   if (!snapshot.hasData) {
                     return const SizedBox(
@@ -978,9 +1210,14 @@ class _RecordsScreenState extends State<RecordsScreen> {
                     );
                   }
 
-                  final folders = snapshot.data!.docs
-                      .map((d) => FolderItem.fromFirestore(d))
-                      .toList();
+                  final folders = snapshot.data!;
+
+                  if (folders.isEmpty) {
+                    return const Text(
+                      "No folders yet. Create one with the Folder button first.",
+                      style: TextStyle(fontSize: 13, color: _C.muted),
+                    );
+                  }
 
                   return Container(
                     width: double.maxFinite,
@@ -1590,6 +1827,12 @@ class _RecordsScreenState extends State<RecordsScreen> {
             spacing: 8,
             runSpacing: 8,
             children: [
+              if (_currentType == RegistryType.filing)
+                _headerActionButton(
+                  icon: Icons.create_new_folder_outlined,
+                  label: "Folder",
+                  onPressed: _openCreateFolderModal,
+                ),
               if (_currentType == RegistryType.filing &&
                   _activeFolderId != null)
                 _headerActionButton(
@@ -1683,6 +1926,12 @@ class _RecordsScreenState extends State<RecordsScreen> {
                     ),
                   ),
                   const SizedBox(height: 16),
+
+                  // Folder chips (Filing tab only, my office's folders)
+                  if (_currentType == RegistryType.filing) ...[
+                    _buildFolderBar(),
+                    const SizedBox(height: 16),
+                  ],
 
                   // Search Bar & Dynamic Counter
                   StreamBuilder<List<RegistryRecord>>(

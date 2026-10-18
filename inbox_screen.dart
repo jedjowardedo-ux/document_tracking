@@ -27,6 +27,13 @@ class _C {
   static const amber = Color(0xFFB7791F);
 }
 
+// Item used by the searchable picker (forward modal)
+class _PickerItem {
+  final String value; // stored value (office name / user id)
+  final String label; // shown and searched
+  const _PickerItem(this.value, this.label);
+}
+
 class InboxScreen extends StatefulWidget {
   const InboxScreen({super.key});
 
@@ -596,14 +603,30 @@ class _InboxScreenState extends State<InboxScreen> {
 
     if (confirm != true) return;
 
+    // NEW: update the document AND write a history row in one batch,
+    // so the Track screen shows this step.
     try {
-      await FirebaseFirestore.instance.collection('documents').doc(docId).update({
+      final db = FirebaseFirestore.instance;
+      final docRef = db.collection('documents').doc(docId);
+      final batch = db.batch();
+
+      batch.update(docRef, {
         'status': newStatus,
         'seenBySender': false,
         'handledBy': FieldValue.arrayUnion([_currentUser!.uid]),
         'lastAction': newStatus,
         'updatedAt': FieldValue.serverTimestamp(),
       });
+
+      batch.set(docRef.collection('history').doc(), {
+        'status': newStatus, // 'approved' | 'rejected'
+        'senderId': _currentUser!.uid, // who made the decision
+        'receiverId': null,
+        'remarks': '',
+        'movedAt': FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
 
       _snack('Document ${label.toLowerCase()}.', color: accent);
     } catch (e) {
@@ -734,6 +757,141 @@ class _InboxScreenState extends State<InboxScreen> {
     );
   }
 
+  // ---------- SEARCHABLE PICKER (used by the Forward modal) ----------
+
+  /// Bottom sheet with a search box. Returns the chosen item's `value`,
+  /// or null if dismissed.
+  Future<String?> _showSearchablePicker({
+    required String title,
+    required String searchHint,
+    required List<_PickerItem> items,
+    String? selectedValue,
+  }) {
+    String query = '';
+
+    return showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setPickerState) {
+            final q = query.trim().toLowerCase();
+            final filtered = items
+                .where((i) => i.label.toLowerCase().contains(q))
+                .toList();
+
+            return Padding(
+              padding: EdgeInsets.only(
+                  bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              child: SizedBox(
+                height: MediaQuery.of(ctx).size.height * 0.7,
+                child: Column(
+                  children: [
+                    const SizedBox(height: 12),
+                    Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: _C.line,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          title,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                            color: _C.ink,
+                          ),
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+                      child: TextField(
+                        autofocus: true,
+                        onChanged: (v) => setPickerState(() => query = v),
+                        decoration: _inputDecoration(searchHint,
+                            icon: Icons.search_rounded),
+                      ),
+                    ),
+                    const Divider(height: 1, color: _C.line),
+                    Expanded(
+                      child: filtered.isEmpty
+                          ? const Center(
+                        child: Text('No matches found',
+                            style: TextStyle(color: _C.muted)),
+                      )
+                          : ListView.builder(
+                        itemCount: filtered.length,
+                        itemBuilder: (_, i) {
+                          final item = filtered[i];
+                          final isSel = item.value == selectedValue;
+                          return ListTile(
+                            title: Text(
+                              item.label,
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: isSel
+                                    ? FontWeight.w800
+                                    : FontWeight.w500,
+                                color: isSel ? _C.blue : _C.text,
+                              ),
+                            ),
+                            trailing: isSel
+                                ? const Icon(Icons.check_rounded,
+                                color: _C.blue)
+                                : null,
+                            onTap: () =>
+                                Navigator.pop(ctx, item.value),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Read-only field that looks like a dropdown and opens the picker on tap.
+  Widget _pickerField({
+    required String? text,
+    required String placeholder,
+    required IconData icon,
+    required VoidCallback? onTap,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: InputDecorator(
+        decoration: _inputDecoration('', icon: icon).copyWith(
+          suffixIcon: const Icon(Icons.search_rounded, color: _C.faint),
+        ),
+        child: Text(
+          text ?? placeholder,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 14,
+            color: text == null ? _C.faint : _C.text,
+          ),
+        ),
+      ),
+    );
+  }
+
   void _openForwardModal(String docId) {
     String? forwardOffice;
     String? forwardUserId;
@@ -786,7 +944,7 @@ class _InboxScreenState extends State<InboxScreen> {
                         style: TextStyle(fontSize: 13, color: _C.muted)),
                     const SizedBox(height: 20),
 
-                    // Target Office Dropdown (Fetched from Firestore 'offices' collection)
+                    // Target Office (searchable, fetched from Firestore 'offices' collection)
                     _fieldLabel('Target office'),
                     StreamBuilder<QuerySnapshot>(
                       stream: FirebaseFirestore.instance
@@ -814,30 +972,36 @@ class _InboxScreenState extends State<InboxScreen> {
                           }).toList();
                         }
 
-                        return DropdownButtonFormField<String>(
-                          value: forwardOffice,
-                          isExpanded: true,
-                          hint: const Text('Select office'),
-                          decoration:
-                          _inputDecoration('', icon: Icons.apartment_rounded),
-                          items: officeOptions
-                              .map((o) => DropdownMenuItem(
-                              value: o,
-                              child: Text(o, overflow: TextOverflow.ellipsis)))
-                              .toList(),
-                          onChanged: (val) {
-                            setModalState(() {
-                              forwardOffice = val;
-                              forwardUserId = null;
-                              forwardUserName = null;
-                            });
+                        // remove duplicates, A-Z
+                        officeOptions = officeOptions.toSet().toList()..sort();
+
+                        return _pickerField(
+                          text: forwardOffice,
+                          placeholder: 'Select office',
+                          icon: Icons.apartment_rounded,
+                          onTap: () async {
+                            final picked = await _showSearchablePicker(
+                              title: 'Select office',
+                              searchHint: 'Search office…',
+                              items: officeOptions
+                                  .map((o) => _PickerItem(o, o))
+                                  .toList(),
+                              selectedValue: forwardOffice,
+                            );
+                            if (picked != null) {
+                              setModalState(() {
+                                forwardOffice = picked;
+                                forwardUserId = null;
+                                forwardUserName = null;
+                              });
+                            }
                           },
                         );
                       },
                     ),
                     const SizedBox(height: 16),
 
-                    // Recipient Dropdown
+                    // Recipient (searchable)
                     _fieldLabel('Recipient'),
                     StreamBuilder<QuerySnapshot>(
                       stream: FirebaseFirestore.instance
@@ -860,37 +1024,40 @@ class _InboxScreenState extends State<InboxScreen> {
                           return uOffice == forwardOffice;
                         }).toList();
 
-                        return DropdownButtonFormField<String>(
-                          value: forwardUserId,
-                          isExpanded: true,
-                          hint: Text(filteredUsers.isEmpty
+                        final userItems = filteredUsers.map((u) {
+                          final data = u.data() as Map<String, dynamic>;
+                          final name =
+                          (data['userName'] ?? data['name'] ?? 'User')
+                              .toString();
+                          return _PickerItem(u.id, name);
+                        }).toList()
+                          ..sort((a, b) => a.label
+                              .toLowerCase()
+                              .compareTo(b.label.toLowerCase()));
+
+                        return _pickerField(
+                          text: forwardUserName,
+                          placeholder: filteredUsers.isEmpty
                               ? 'No recipient found for this office'
-                              : 'Select person'),
-                          decoration: _inputDecoration('',
-                              icon: Icons.person_outline_rounded),
-                          items: filteredUsers.map((u) {
-                            final data = u.data() as Map<String, dynamic>;
-                            final name =
-                                data['userName'] ?? data['name'] ?? 'User';
-                            return DropdownMenuItem<String>(
-                                value: u.id,
-                                child: Text(name, overflow: TextOverflow.ellipsis));
-                          }).toList(),
-                          onChanged: filteredUsers.isEmpty
+                              : 'Select person',
+                          icon: Icons.person_outline_rounded,
+                          onTap: filteredUsers.isEmpty
                               ? null
-                              : (val) {
-                            setModalState(() {
-                              forwardUserId = val;
-                              if (val != null) {
-                                final selectedDoc = filteredUsers
-                                    .firstWhere((u) => u.id == val);
-                                final data = selectedDoc.data()
-                                as Map<String, dynamic>;
-                                forwardUserName = data['userName'] ??
-                                    data['name'] ??
-                                    'User';
-                              }
-                            });
+                              : () async {
+                            final pickedId = await _showSearchablePicker(
+                              title: 'Select recipient',
+                              searchHint: 'Search person…',
+                              items: userItems,
+                              selectedValue: forwardUserId,
+                            );
+                            if (pickedId != null) {
+                              final item = userItems.firstWhere(
+                                      (i) => i.value == pickedId);
+                              setModalState(() {
+                                forwardUserId = pickedId;
+                                forwardUserName = item.label;
+                              });
+                            }
                           },
                         );
                       },
@@ -1012,10 +1179,23 @@ class _InboxScreenState extends State<InboxScreen> {
                             updatePayload['fileExtension'] = newFile!.extension;
                           }
 
-                          await FirebaseFirestore.instance
-                              .collection('documents')
-                              .doc(docId)
-                              .update(updatePayload);
+                          // NEW: update the document AND write a history row
+                          // in one batch, so the Track screen shows this step.
+                          final db = FirebaseFirestore.instance;
+                          final docRef = db.collection('documents').doc(docId);
+                          final batch = db.batch();
+
+                          batch.update(docRef, updatePayload);
+
+                          batch.set(docRef.collection('history').doc(), {
+                            'status': 'forwarded',
+                            'senderId': _currentUser!.uid, // who is forwarding
+                            'receiverId': forwardUserId, // who receives it
+                            'remarks': remarksController.text.trim(),
+                            'movedAt': FieldValue.serverTimestamp(),
+                          });
+
+                          await batch.commit();
 
                           if (!mounted) return;
                           Navigator.pop(bottomCtx);
